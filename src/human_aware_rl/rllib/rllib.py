@@ -717,7 +717,7 @@ def gen_trainer_from_params(params):
         results_dir = params["results_dir"]
         if not os.path.exists(results_dir):
             try:
-                os.makedirs(results_dir)
+                os.makedirs(results_dir, exist_ok=True)
             except Exception as e:
                 print(
                     "error creating custom logging dir. Falling back to default logdir {}".format(
@@ -725,6 +725,8 @@ def gen_trainer_from_params(params):
                     )
                 )
                 results_dir = DEFAULT_RESULTS_DIR
+        if not os.path.exists(results_dir):
+            os.makedirs(results_dir, exist_ok=True)
         logdir = tempfile.mkdtemp(prefix=logdir_prefix, dir=results_dir)
         logger = UnifiedLogger(config, logdir, loggers=None)
         return logger
@@ -833,21 +835,59 @@ def load_trainer(save_path, true_num_workers=False):
     # Get un-trained trainer object with proper config
     trainer = gen_trainer_from_params(config)
 
-    # Search for the checkpoint folder in the save_path that has the highest number. Checkpoint folders are named checkpoint_<number>
-    checkpoint_dirs = [d for d in os.listdir(save_path) if d.startswith("checkpoint_")]
-    if not checkpoint_dirs:
-        raise ValueError(f"No checkpoint directories found in {save_path}")
+    entries = os.listdir(save_path)
+    checkpoint_dirs = [
+        d
+        for d in entries
+        if d.startswith("checkpoint_")
+        and os.path.isdir(os.path.join(save_path, d))
+    ]
 
-    # Find directory with highest checkpoint number (2025: this was recently changed because previously checkpoints didn't have this format)
-    latest_dir = checkpoint_dirs[0]
-    latest_num = int(latest_dir.split("_")[1].lstrip("0") or "0")
-    for d in checkpoint_dirs[1:]:
-        num = int(d.split("_")[1].lstrip("0") or "0")
-        if num > latest_num:
-            latest_num = num
-            latest_dir = d
+    checkpoint_file = None
+    if checkpoint_dirs:
+        latest_dir = checkpoint_dirs[0]
+        latest_num = int(latest_dir.split("_")[1].lstrip("0") or "0")
+        for d in checkpoint_dirs[1:]:
+            num = int(d.split("_")[1].lstrip("0") or "0")
+            if num > latest_num:
+                latest_num = num
+                latest_dir = d
+        checkpoint_file = os.path.join(save_path, latest_dir)
+    else:
+        checkpoint_files = [
+            f
+            for f in entries
+            if f.startswith("checkpoint-")
+            and os.path.isfile(os.path.join(save_path, f))
+        ]
+        if not checkpoint_files:
+            raise ValueError(
+                f"No checkpoint artifacts found in {save_path}"
+            )
 
-    checkpoint_file = os.path.join(save_path, latest_dir + "/")
+        latest_file = checkpoint_files[0]
+        latest_num = int(latest_file.split("-")[1].lstrip("0") or "0")
+        for f in checkpoint_files[1:]:
+            num = int(f.split("-")[1].lstrip("0") or "0")
+            if num > latest_num:
+                latest_num = num
+                latest_file = f
+        checkpoint_file = save_path
+
+        metadata_path = os.path.join(save_path, ".tune_metadata")
+        if os.path.exists(metadata_path):
+            import pickle as py_pickle
+
+            try:
+                with open(metadata_path, "rb") as f:
+                    py_pickle.load(f)
+            except Exception:
+                with open(metadata_path, "rb") as f:
+                    metadata = py_pickle.load(f, encoding="latin1")
+                with open(metadata_path, "wb") as f:
+                    py_pickle.dump(
+                        metadata, f, protocol=py_pickle.HIGHEST_PROTOCOL
+                    )
 
     # Load weights into dummy object
     trainer.restore(checkpoint_file)

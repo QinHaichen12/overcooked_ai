@@ -298,9 +298,24 @@ def load_bc_model(model_dir, verbose=False):
     if verbose:
         print("Loading bc model from ", model_dir)
 
-    # Load model from .keras file
-    model_path = os.path.join(model_dir, "model.keras")
-    model = keras.models.load_model(model_path, custom_objects={"tf": tf})
+    keras_path = os.path.join(model_dir, "model.keras")
+    if os.path.exists(keras_path):
+        model = keras.models.load_model(keras_path, custom_objects={"tf": tf})
+    else:
+        saved_model_path = model_dir
+        if not os.path.exists(os.path.join(saved_model_path, "saved_model.pb")):
+            checkpoint_saved_model = os.path.join(model_dir, "checkpoints")
+            if os.path.exists(
+                os.path.join(checkpoint_saved_model, "saved_model.pb")
+            ):
+                saved_model_path = checkpoint_saved_model
+            else:
+                raise FileNotFoundError(
+                    f"No model.keras or SavedModel found in {model_dir}"
+                )
+        model = keras.models.load_model(
+            saved_model_path, custom_objects={"tf": tf}
+        )
 
     # Load metadata
     with open(os.path.join(model_dir, "metadata.pickle"), "rb") as f:
