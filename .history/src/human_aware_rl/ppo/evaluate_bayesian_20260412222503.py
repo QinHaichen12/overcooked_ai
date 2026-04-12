@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 
-from overcooked_ai_py.agents.agent import AgentPair, RandomAgent, GreedyHumanModel
+from overcooked_ai_py.agents.agent import AgentPair, RandomAgent
 from overcooked_ai_py.agents.benchmarking import AgentEvaluator
 from overcooked_ai_py.mdp.actions import Action
 
@@ -121,7 +121,7 @@ def evaluate_condition(
             use_commitment=use_commitment,
             use_yield=use_yield,
         )
-        partner = GreedyHumanModel(ae.env.mlam)
+        # partner = RandomAgent(all_actions=Action.ALL_ACTIONS) 
         ap = AgentPair(partner, bayes)
 
         traj = ae.evaluate_agent_pair(ap, num_games=episodes, native_eval=True)

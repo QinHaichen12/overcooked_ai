@@ -9,10 +9,11 @@ from queue import Empty, Full, LifoQueue, Queue
 from threading import Lock, Thread
 from time import time
 
-import ray
+try:
+    import ray
+except ImportError:
+    ray = None
 from utils import DOCKER_VOLUME, create_dirs
-
-from human_aware_rl.rllib.rllib import load_agent
 from overcooked_ai_py.agents.agent import RandomAgent
 from overcooked_ai_py.mdp.actions import Action, Direction
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
@@ -471,7 +472,7 @@ class OvercookedGame(Game):
             self.npc_state_queues[player_one_id] = LifoQueue()
         # Always kill ray after loading agent, otherwise, ray will crash once process exits
         # Only kill ray after loading both agents to avoid having to restart ray during loading
-        if ray.is_initialized():
+        if ray is not None and ray.is_initialized():
             ray.shutdown()
 
         if kwargs["dataCollection"]:
@@ -688,6 +689,8 @@ class OvercookedGame(Game):
 
         if npc_id.lower().startswith("rllib"):
             try:
+                from human_aware_rl.rllib.rllib import load_agent
+
                 # Loading rllib agents requires additional helpers
                 fpath = os.path.abspath(
                     os.path.join(AGENT_DIR, npc_id, "agent")
@@ -906,15 +909,26 @@ class BayesianBeliefAI:
     def _update_intent_belief(self, state, mdp, human_idx, layout_name):
         human = state.players[human_idx]
         observed_action = self._infer_observed_action(self._prev_human_obs, human)
-        likelihood = self._heuristic_likelihood(state, mdp, human)
+        likelihood = self._heuristic_likelihood(
+            state,
+            mdp,
+            human,
+            observed_action=observed_action,
+            prev_obs=self._prev_human_obs,
+        )
 
         if self.model and self.use_model_likelihood:
             model_likelihood = self._model_likelihood(
-                state, mdp, human, layout_name, observed_action
+                state,
+                mdp,
+                human,
+                layout_name,
+                observed_action,
+                prev_obs=self._prev_human_obs,
             )
             for intent in self.INTENTS:
                 likelihood[intent] = (
-                    0.6 * model_likelihood[intent] + 0.4 * likelihood[intent]
+                    0.65 * model_likelihood[intent] + 0.35 * likelihood[intent]
                 )
 
         prior = self._transition_prior(layout_name)
@@ -936,30 +950,88 @@ class BayesianBeliefAI:
         }
         self._prev_human_obs = self._snapshot_player_state(human)
 
-    def _heuristic_likelihood(self, state, mdp, human):
+    def _heuristic_likelihood(
+        self, state, mdp, human, observed_action=None, prev_obs=None
+    ):
         likelihood = {intent: 0.10 for intent in self.INTENTS}
         pot_states = mdp.get_pot_states(state)
-        has_ready_or_cooking = bool(pot_states["ready"] or pot_states["cooking"])
+        has_ready = bool(pot_states["ready"])
+        has_cooking = bool(pot_states["cooking"])
+        has_ready_or_cooking = bool(has_ready or has_cooking)
+        has_ready_to_cook = bool(pot_states.get("3_items"))
+        context_bucket = self._context_bucket(state, mdp)
+        progress_bucket = self._progress_bucket(
+            human, mdp, observed_action, prev_obs=prev_obs
+        )
 
         if human.has_object():
             obj_name = human.get_object().name
             if obj_name in ["onion", "tomato"]:
                 likelihood["put_in_pot"] = 0.75
+                if observed_action == Action.INTERACT and self._is_near_any(
+                    human.position, mdp.get_pot_locations()
+                ):
+                    likelihood["put_in_pot"] = 0.95
             elif obj_name == "dish":
                 likelihood["pickup_soup"] = 0.70
+                if observed_action == Action.INTERACT and self._is_near_any(
+                    human.position, mdp.get_pot_locations()
+                ):
+                    likelihood["pickup_soup"] = 0.96
             elif obj_name == "soup":
                 likelihood["deliver_soup"] = 0.85
+                if observed_action == Action.INTERACT and self._is_near_any(
+                    human.position, mdp.get_serving_locations()
+                ):
+                    likelihood["deliver_soup"] = 0.98
         else:
             if self._is_near_any(human.position, mdp.get_onion_dispenser_locations()):
                 likelihood["get_onion"] = 0.65
             if self._is_near_any(human.position, mdp.get_tomato_dispenser_locations()):
                 likelihood["get_tomato"] = 0.65
             if self._is_near_any(human.position, mdp.get_dish_dispenser_locations()):
-                likelihood["get_dish"] = 0.65
+                likelihood["get_dish"] = 0.72 if has_ready_or_cooking else 0.65
             if has_ready_or_cooking and self._is_near_any(
                 human.position, mdp.get_pot_locations()
             ):
-                likelihood["start_cooking"] = 0.55
+                likelihood["pickup_soup"] = max(likelihood["pickup_soup"], 0.52)
+
+        if progress_bucket == "toward_onion":
+            likelihood["get_onion"] = max(likelihood["get_onion"], 0.60)
+        elif progress_bucket == "toward_tomato":
+            likelihood["get_tomato"] = max(likelihood["get_tomato"], 0.60)
+        elif progress_bucket == "toward_dish":
+            likelihood["get_dish"] = max(
+                likelihood["get_dish"], 0.72 if has_ready_or_cooking else 0.58
+            )
+        elif progress_bucket == "toward_pot":
+            if human.has_object() and human.get_object().name in ["onion", "tomato"]:
+                likelihood["put_in_pot"] = max(likelihood["put_in_pot"], 0.82)
+            elif has_ready_to_cook:
+                likelihood["start_cooking"] = max(likelihood["start_cooking"], 0.78)
+        elif progress_bucket == "toward_serve":
+            likelihood["deliver_soup"] = max(likelihood["deliver_soup"], 0.58)
+
+        if observed_action == Action.INTERACT and self._is_near_any(
+            human.position, mdp.get_pot_locations()
+        ):
+            if human.has_object() and human.get_object().name in ["onion", "tomato"]:
+                likelihood["put_in_pot"] = 0.96
+            elif human.has_object() and human.get_object().name == "dish":
+                likelihood["pickup_soup"] = 0.96
+            elif has_ready_to_cook:
+                likelihood["start_cooking"] = 0.92
+
+        if context_bucket == "ready":
+            likelihood["get_dish"] = max(likelihood["get_dish"], 0.68)
+            likelihood["pickup_soup"] = max(likelihood["pickup_soup"], 0.62)
+        elif context_bucket == "cooking":
+            likelihood["get_dish"] = max(likelihood["get_dish"], 0.58)
+        elif context_bucket == "ready_to_cook":
+            likelihood["start_cooking"] = max(likelihood["start_cooking"], 0.74)
+        elif context_bucket == "needs_ingredient":
+            likelihood["get_onion"] = max(likelihood["get_onion"], 0.52)
+            likelihood["get_tomato"] = max(likelihood["get_tomato"], 0.52)
         return likelihood
 
     def _transition_prior(self, layout_name):
@@ -990,25 +1062,52 @@ class BayesianBeliefAI:
             return {intent: p for intent in self.INTENTS}
         return {k: v / z for k, v in prior.items()}
 
-    def _model_likelihood(self, state, mdp, human, layout_name, observed_action=None):
-        del layout_name  # reserved for future layout-specific emissions
+    def _model_likelihood(
+        self, state, mdp, human, layout_name, observed_action=None, prev_obs=None
+    ):
         emissions = self.model.get("emissions", {}) if self.model else {}
-        held_probs = emissions.get("held", {})
-        prox_probs = emissions.get("proximity", {})
-        action_probs = emissions.get("action", {})
+        layout_emissions = self.model.get("layout_emissions", {}) if self.model else {}
+        held_probs = self._resolve_emission_table(
+            emissions, layout_emissions, "held", layout_name
+        )
+        prox_probs = self._resolve_emission_table(
+            emissions, layout_emissions, "proximity", layout_name
+        )
+        action_probs = self._resolve_emission_table(
+            emissions, layout_emissions, "action", layout_name
+        )
+        context_probs = self._resolve_emission_table(
+            emissions, layout_emissions, "context", layout_name
+        )
+        progress_probs = self._resolve_emission_table(
+            emissions, layout_emissions, "progress", layout_name
+        )
 
         held_bucket = self._held_bucket(human)
         prox_bucket = self._proximity_bucket(human, mdp)
+        context_bucket = self._context_bucket(state, mdp)
+        progress_bucket = self._progress_bucket(
+            human, mdp, observed_action, prev_obs=prev_obs
+        )
         action_key = str(observed_action) if observed_action is not None else None
 
         likelihood = {}
         for intent in self.INTENTS:
             p_held = held_probs.get(intent, {}).get(held_bucket, 1e-3)
             p_prox = prox_probs.get(intent, {}).get(prox_bucket, 1e-3)
+            p_context = context_probs.get(intent, {}).get(context_bucket, 1.0)
+            p_progress = progress_probs.get(intent, {}).get(progress_bucket, 1.0)
             p_action = 1.0
             if action_key is not None:
                 p_action = action_probs.get(intent, {}).get(action_key, 1e-3)
-            likelihood[intent] = max(1e-6, p_held * p_prox * math.sqrt(p_action))
+            likelihood[intent] = max(
+                1e-6,
+                p_held
+                * p_prox
+                * math.sqrt(p_action)
+                * math.sqrt(p_context)
+                * math.sqrt(p_progress),
+            )
 
         z = sum(likelihood.values())
         if z <= 0:
@@ -1023,6 +1122,65 @@ class BayesianBeliefAI:
         if obj_name in ["onion", "tomato", "dish", "soup"]:
             return obj_name
         return "other"
+
+    def _context_bucket(self, state, mdp):
+        pot_states = mdp.get_pot_states(state)
+        if pot_states["ready"]:
+            return "ready"
+        if pot_states["cooking"]:
+            return "cooking"
+        if pot_states.get("3_items"):
+            return "ready_to_cook"
+
+        open_pots = (
+            list(pot_states["empty"])
+            + list(pot_states["1_items"])
+            + list(pot_states["2_items"])
+        )
+        if open_pots:
+            return "needs_ingredient"
+        return "other"
+
+    def _progress_bucket(self, player, mdp, observed_action, prev_obs=None):
+        if observed_action not in Action.MOTION_ACTIONS:
+            return "none"
+
+        start_pos = prev_obs["position"] if prev_obs is not None else player.position
+        end_pos = (
+            player.position
+            if prev_obs is not None
+            else Action.move_in_direction(player.position, observed_action)
+        )
+        feature_targets = [
+            ("toward_onion", mdp.get_onion_dispenser_locations()),
+            ("toward_tomato", mdp.get_tomato_dispenser_locations()),
+            ("toward_dish", mdp.get_dish_dispenser_locations()),
+            ("toward_pot", mdp.get_pot_locations()),
+            ("toward_serve", mdp.get_serving_locations()),
+        ]
+
+        best_bucket = "none"
+        best_improvement = 0
+        for bucket, targets in feature_targets:
+            current_dist = self._min_distance(start_pos, targets)
+            next_dist = self._min_distance(end_pos, targets)
+            if current_dist is None or next_dist is None:
+                continue
+            improvement = current_dist - next_dist
+            if improvement > best_improvement:
+                best_improvement = improvement
+                best_bucket = bucket
+
+        return best_bucket
+
+    def _resolve_emission_table(
+        self, emissions, layout_emissions, emission_name, layout_name
+    ):
+        if layout_name:
+            layout_specific = layout_emissions.get(emission_name, {}).get(layout_name)
+            if layout_specific:
+                return layout_specific
+        return emissions.get(emission_name, {})
 
     def _snapshot_player_state(self, player):
         held_name = None
@@ -1088,6 +1246,12 @@ class BayesianBeliefAI:
             if token in lname:
                 return "constrained"
         return "open"
+
+    @staticmethod
+    def _min_distance(pos, targets):
+        if not targets:
+            return None
+        return min(abs(pos[0] - t[0]) + abs(pos[1] - t[1]) for t in targets)
 
     def _commitment_strength(self):
         if not self.intent_history:

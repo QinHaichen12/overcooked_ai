@@ -1,0 +1,239 @@
+{
+  "config": {
+    "layouts": [
+      "cramped_room",
+      "coordination_ring",
+      "forced_coordination",
+      "counter_circuit_o_1order"
+    ],
+    "episodes": 30,
+    "horizon": 400,
+    "model_path": "src/overcooked_demo/server/static/assets/agents/BayesianBeliefAI/model_v2.pkl"
+  },
+  "conditions": {
+    "full_model": {
+      "layouts": {
+        "cramped_room": {
+          "episodes": 30,
+          "mean_sparse_return": 94.0,
+          "std_sparse_return": 43.86342439892262,
+          "ci95_sparse_return": 15.964657517628504,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 4.7,
+          "idle_ratio_mean": 0.6431666666666666,
+          "interact_ratio_mean": 0.09183333333333335,
+          "belief_entropy_mean": 0.8008989203471516,
+          "intent_switch_rate_mean": 0.08036758563074352
+        },
+        "coordination_ring": {
+          "episodes": 30,
+          "mean_sparse_return": 134.66666666666666,
+          "std_sparse_return": 38.62066228789397,
+          "ci95_sparse_return": 14.05648681057748,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 6.7333333333333325,
+          "idle_ratio_mean": 0.30891666666666673,
+          "interact_ratio_mean": 0.10991666666666666,
+          "belief_entropy_mean": 1.0415051581681214,
+          "intent_switch_rate_mean": 0.22673350041771098
+        },
+        "forced_coordination": {
+          "episodes": 30,
+          "mean_sparse_return": 0.0,
+          "std_sparse_return": 0.0,
+          "ci95_sparse_return": 0.0,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 0.0,
+          "idle_ratio_mean": 0.9525000000000001,
+          "interact_ratio_mean": 0.0175,
+          "belief_entropy_mean": 1.0246178848179348,
+          "intent_switch_rate_mean": 0.0
+        },
+        "counter_circuit_o_1order": {
+          "episodes": 30,
+          "mean_sparse_return": 75.33333333333333,
+          "std_sparse_return": 59.258379623101035,
+          "ci95_sparse_return": 21.5678494941143,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 3.7666666666666666,
+          "idle_ratio_mean": 0.0,
+          "interact_ratio_mean": 0.07833333333333335,
+          "belief_entropy_mean": 0.8686493584240028,
+          "intent_switch_rate_mean": 0.0827067669172932
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 76.0,
+        "std_layout_return": 48.842149374854046
+      }
+    },
+    "ablate_transition_prior": {
+      "layouts": {
+        "cramped_room": {
+          "episodes": 30,
+          "mean_sparse_return": 84.66666666666667,
+          "std_sparse_return": 31.27654428197307,
+          "ci95_sparse_return": 11.383500596203032,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 4.233333333333333,
+          "idle_ratio_mean": 0.6431666666666668,
+          "interact_ratio_mean": 0.08775000000000001,
+          "belief_entropy_mean": 0.6120241879842951,
+          "intent_switch_rate_mean": 0.07042606516290725
+        },
+        "coordination_ring": {
+          "episodes": 30,
+          "mean_sparse_return": 143.33333333333334,
+          "std_sparse_return": 34.286375654996775,
+          "ci95_sparse_return": 12.478967439355326,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 7.166666666666667,
+          "idle_ratio_mean": 0.2820833333333334,
+          "interact_ratio_mean": 0.1130833333333333,
+          "belief_entropy_mean": 0.7845584083977547,
+          "intent_switch_rate_mean": 0.11562238930659981
+        },
+        "forced_coordination": {
+          "episodes": 30,
+          "mean_sparse_return": 0.0,
+          "std_sparse_return": 0.0,
+          "ci95_sparse_return": 0.0,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 0.0,
+          "idle_ratio_mean": 0.9525000000000001,
+          "interact_ratio_mean": 0.0175,
+          "belief_entropy_mean": 0.5477060073810275,
+          "intent_switch_rate_mean": 0.0
+        },
+        "counter_circuit_o_1order": {
+          "episodes": 30,
+          "mean_sparse_return": 75.33333333333333,
+          "std_sparse_return": 55.781319055357194,
+          "ci95_sparse_return": 20.3023285756553,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 3.7666666666666666,
+          "idle_ratio_mean": 0.0,
+          "interact_ratio_mean": 0.08041666666666666,
+          "belief_entropy_mean": 0.6567806101636025,
+          "intent_switch_rate_mean": 0.07886382623224727
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 75.83333333333333,
+        "std_layout_return": 50.95395524937741
+      }
+    },
+    "ablate_model_likelihood": {
+      "layouts": {
+        "cramped_room": {
+          "episodes": 30,
+          "mean_sparse_return": 80.66666666666667,
+          "std_sparse_return": 26.574841903992997,
+          "ci95_sparse_return": 9.67225553855279,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 4.033333333333333,
+          "idle_ratio_mean": 0.6531666666666668,
+          "interact_ratio_mean": 0.08625,
+          "belief_entropy_mean": 0.9854946671983512,
+          "intent_switch_rate_mean": 0.03366750208855472
+        },
+        "coordination_ring": {
+          "episodes": 30,
+          "mean_sparse_return": 123.33333333333333,
+          "std_sparse_return": 32.28346670080867,
+          "ci95_sparse_return": 11.749982962407149,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 6.166666666666666,
+          "idle_ratio_mean": 0.35458333333333325,
+          "interact_ratio_mean": 0.10166666666666664,
+          "belief_entropy_mean": 0.977598506604063,
+          "intent_switch_rate_mean": 0.05271512113617376
+        },
+        "forced_coordination": {
+          "episodes": 30,
+          "mean_sparse_return": 0.0,
+          "std_sparse_return": 0.0,
+          "ci95_sparse_return": 0.0,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 0.0,
+          "idle_ratio_mean": 0.9525000000000001,
+          "interact_ratio_mean": 0.0175,
+          "belief_entropy_mean": 1.092100384971911,
+          "intent_switch_rate_mean": 0.0
+        },
+        "counter_circuit_o_1order": {
+          "episodes": 30,
+          "mean_sparse_return": 20.0,
+          "std_sparse_return": 0.0,
+          "ci95_sparse_return": 0.0,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 1.0,
+          "idle_ratio_mean": 0.0,
+          "interact_ratio_mean": 0.02500000000000001,
+          "belief_entropy_mean": 0.8318361700937921,
+          "intent_switch_rate_mean": 0.015037593984962405
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 56.0,
+        "std_layout_return": 48.92397730720138
+      }
+    },
+    "ablate_commitment": {
+      "layouts": {
+        "cramped_room": {
+          "episodes": 30,
+          "mean_sparse_return": 87.33333333333333,
+          "std_sparse_return": 34.441576941571974,
+          "ci95_sparse_return": 12.535454943931672,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 4.366666666666666,
+          "idle_ratio_mean": 0.5895833333333333,
+          "interact_ratio_mean": 0.09133333333333332,
+          "belief_entropy_mean": 0.8184349790404046,
+          "intent_switch_rate_mean": 0.08588137009189639
+        },
+        "coordination_ring": {
+          "episodes": 30,
+          "mean_sparse_return": 136.0,
+          "std_sparse_return": 35.552777669262355,
+          "ci95_sparse_return": 12.939890741957331,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 6.8,
+          "idle_ratio_mean": 0.30908333333333327,
+          "interact_ratio_mean": 0.11016666666666666,
+          "belief_entropy_mean": 1.042723949956928,
+          "intent_switch_rate_mean": 0.2477861319966583
+        },
+        "forced_coordination": {
+          "episodes": 30,
+          "mean_sparse_return": 0.0,
+          "std_sparse_return": 0.0,
+          "ci95_sparse_return": 0.0,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 0.0,
+          "idle_ratio_mean": 0.9525000000000001,
+          "interact_ratio_mean": 0.0175,
+          "belief_entropy_mean": 1.0246178848179348,
+          "intent_switch_rate_mean": 0.0
+        },
+        "counter_circuit_o_1order": {
+          "episodes": 30,
+          "mean_sparse_return": 59.333333333333336,
+          "std_sparse_return": 55.7334928227383,
+          "ci95_sparse_return": 20.284921603113094,
+          "mean_episode_length": 400.0,
+          "estimated_soups_mean": 2.966666666666667,
+          "idle_ratio_mean": 0.0,
+          "interact_ratio_mean": 0.06599999999999999,
+          "belief_entropy_mean": 0.8601786289713325,
+          "intent_switch_rate_mean": 0.08721804511278194
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 70.66666666666666,
+        "std_layout_return": 49.16412422804977
+      }
+    }
+  }
+}

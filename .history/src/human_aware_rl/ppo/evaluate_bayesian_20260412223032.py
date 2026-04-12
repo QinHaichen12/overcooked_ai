@@ -121,7 +121,8 @@ def evaluate_condition(
             use_commitment=use_commitment,
             use_yield=use_yield,
         )
-        partner = GreedyHumanModel(ae.env.mlam)
+        # partner = RandomAgent(all_actions=Action.ALL_ACTIONS) # shouldnt we use greedyhuman here?
+        partner = GreedyHu
         ap = AgentPair(partner, bayes)
 
         traj = ae.evaluate_agent_pair(ap, num_games=episodes, native_eval=True)

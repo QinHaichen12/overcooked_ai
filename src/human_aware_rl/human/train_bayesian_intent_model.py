@@ -27,6 +27,21 @@ INTENTS = [
 
 HELD_BUCKETS = ["none", "onion", "tomato", "dish", "soup", "other"]
 PROX_BUCKETS = ["none", "onion", "tomato", "dish", "pot", "serve"]
+CONTEXT_BUCKETS = [
+    "ready",
+    "cooking",
+    "ready_to_cook",
+    "needs_ingredient",
+    "other",
+]
+PROGRESS_BUCKETS = [
+    "toward_onion",
+    "toward_tomato",
+    "toward_dish",
+    "toward_pot",
+    "toward_serve",
+    "none",
+]
 
 
 def _layout_group(layout_name):
@@ -75,14 +90,79 @@ def _proximity_bucket(player, mdp):
     return "none"
 
 
-def _infer_intent(player, state, mdp):
+def _min_distance(pos, targets):
+    if not targets:
+        return None
+    return min(abs(pos[0] - t[0]) + abs(pos[1] - t[1]) for t in targets)
+
+
+def _context_bucket(state, mdp):
+    pot_states = mdp.get_pot_states(state)
+    if pot_states["ready"]:
+        return "ready"
+    if pot_states["cooking"]:
+        return "cooking"
+    if pot_states.get("3_items"):
+        return "ready_to_cook"
+
+    open_pots = (
+        list(pot_states["empty"])
+        + list(pot_states["1_items"])
+        + list(pot_states["2_items"])
+    )
+    if open_pots:
+        return "needs_ingredient"
+    return "other"
+
+
+def _progress_bucket(player, mdp, action):
+    if action not in Action.MOTION_ACTIONS:
+        return "none"
+
+    next_pos = Action.move_in_direction(player.position, action)
+    feature_targets = [
+        ("toward_onion", mdp.get_onion_dispenser_locations()),
+        ("toward_tomato", mdp.get_tomato_dispenser_locations()),
+        ("toward_dish", mdp.get_dish_dispenser_locations()),
+        ("toward_pot", mdp.get_pot_locations()),
+        ("toward_serve", mdp.get_serving_locations()),
+    ]
+
+    best_bucket = "none"
+    best_improvement = 0
+    for bucket, targets in feature_targets:
+        current_dist = _min_distance(player.position, targets)
+        next_dist = _min_distance(next_pos, targets)
+        if current_dist is None or next_dist is None:
+            continue
+        improvement = current_dist - next_dist
+        if improvement > best_improvement:
+            best_improvement = improvement
+            best_bucket = bucket
+
+    return best_bucket
+
+
+def _infer_intent(player, state, mdp, player_action=None):
     if player.has_object():
         obj = player.get_object().name
         if obj in ["onion", "tomato"]:
+            if player_action == Action.INTERACT and _near_any(
+                player.position, mdp.get_pot_locations()
+            ):
+                return "put_in_pot", 0.99
             return "put_in_pot", 0.95
         if obj == "dish":
+            if player_action == Action.INTERACT and _near_any(
+                player.position, mdp.get_pot_locations()
+            ):
+                return "pickup_soup", 0.98
             return "pickup_soup", 0.90
         if obj == "soup":
+            if player_action == Action.INTERACT and _near_any(
+                player.position, mdp.get_serving_locations()
+            ):
+                return "deliver_soup", 0.99
             return "deliver_soup", 0.98
 
     near_onion = _near_any(player.position, mdp.get_onion_dispenser_locations())
@@ -91,15 +171,28 @@ def _infer_intent(player, state, mdp):
     near_pot = _near_any(player.position, mdp.get_pot_locations())
     near_serve = _near_any(player.position, mdp.get_serving_locations())
     pot_states = mdp.get_pot_states(state)
+    context = _context_bucket(state, mdp)
+    progress = _progress_bucket(player, mdp, player_action)
 
-    if near_onion:
+    if player_action == Action.INTERACT and near_pot and pot_states.get("3_items"):
+        return "start_cooking", 0.95
+
+    if near_onion or progress == "toward_onion":
         return "get_onion", 0.70
-    if near_tomato:
+    if near_tomato or progress == "toward_tomato":
         return "get_tomato", 0.70
-    if near_dish:
+    if near_dish or progress == "toward_dish":
+        if context in ["ready", "cooking"]:
+            return "get_dish", 0.78
         return "get_dish", 0.70
     if near_pot and (pot_states["ready"] or pot_states["cooking"]):
         return "start_cooking", 0.65
+    if near_pot and context == "ready_to_cook":
+        return "start_cooking", 0.72
+    if progress == "toward_pot" and context in ["needs_ingredient", "ready_to_cook"]:
+        return "put_in_pot", 0.62
+    if progress == "toward_serve":
+        return "deliver_soup", 0.62
     if near_serve:
         return "deliver_soup", 0.55
 
@@ -132,6 +225,13 @@ def train_model(df, layouts=None, alpha=1.0):
     held_emission_counts = defaultdict(lambda: defaultdict(float))
     prox_emission_counts = defaultdict(lambda: defaultdict(float))
     action_counts = defaultdict(lambda: defaultdict(float))
+    context_emission_counts = defaultdict(lambda: defaultdict(float))
+    progress_emission_counts = defaultdict(lambda: defaultdict(float))
+    layout_held_emission_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    layout_prox_emission_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    layout_action_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    layout_context_emission_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
+    layout_progress_emission_counts = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
 
     prev_intent = {}
     mdp_cache = {}
@@ -151,13 +251,28 @@ def train_model(df, layouts=None, alpha=1.0):
 
         for player_idx in [0, 1]:
             player = state.players[player_idx]
-            intent, confidence = _infer_intent(player, state, mdp)
+            player_action = joint_action[player_idx]
+            intent, confidence = _infer_intent(
+                player, state, mdp, player_action=player_action
+            )
+            held_bucket = _held_bucket(player)
+            prox_bucket = _proximity_bucket(player, mdp)
+            context_bucket = _context_bucket(state, mdp)
+            progress_bucket = _progress_bucket(player, mdp, player_action)
+            action_key = str(player_action)
 
             prior_counts[group][intent] += confidence
             layout_prior_counts[layout_name][intent] += confidence
-            held_emission_counts[intent][_held_bucket(player)] += confidence
-            prox_emission_counts[intent][_proximity_bucket(player, mdp)] += confidence
-            action_counts[intent][str(joint_action[player_idx])] += confidence
+            held_emission_counts[intent][held_bucket] += confidence
+            prox_emission_counts[intent][prox_bucket] += confidence
+            action_counts[intent][action_key] += confidence
+            context_emission_counts[intent][context_bucket] += confidence
+            progress_emission_counts[intent][progress_bucket] += confidence
+            layout_held_emission_counts[layout_name][intent][held_bucket] += confidence
+            layout_prox_emission_counts[layout_name][intent][prox_bucket] += confidence
+            layout_action_counts[layout_name][intent][action_key] += confidence
+            layout_context_emission_counts[layout_name][intent][context_bucket] += confidence
+            layout_progress_emission_counts[layout_name][intent][progress_bucket] += confidence
 
             seq_key = (trial_id, player_idx)
             if seq_key in prev_intent:
@@ -174,6 +289,8 @@ def train_model(df, layouts=None, alpha=1.0):
         "layout_groups": ["constrained", "open"],
         "held_buckets": list(HELD_BUCKETS),
         "proximity_buckets": list(PROX_BUCKETS),
+        "context_buckets": list(CONTEXT_BUCKETS),
+        "progress_buckets": list(PROGRESS_BUCKETS),
         "priors": {},
         "transitions": {},
         "layout_priors": {},
@@ -182,6 +299,15 @@ def train_model(df, layouts=None, alpha=1.0):
             "held": {},
             "proximity": {},
             "action": {},
+            "context": {},
+            "progress": {},
+        },
+        "layout_emissions": {
+            "held": {},
+            "proximity": {},
+            "action": {},
+            "context": {},
+            "progress": {},
         },
         "stats": {
             "timesteps": int(len(df)),
@@ -220,6 +346,40 @@ def train_model(df, layouts=None, alpha=1.0):
         model["emissions"]["action"][intent] = _normalize_counts(
             action_counts[intent], action_support, alpha
         )
+        model["emissions"]["context"][intent] = _normalize_counts(
+            context_emission_counts[intent], CONTEXT_BUCKETS, alpha
+        )
+        model["emissions"]["progress"][intent] = _normalize_counts(
+            progress_emission_counts[intent], PROGRESS_BUCKETS, alpha
+        )
+
+    for layout_name in sorted(set(df["layout_name"])):
+        model["layout_emissions"]["held"][layout_name] = {}
+        model["layout_emissions"]["proximity"][layout_name] = {}
+        model["layout_emissions"]["action"][layout_name] = {}
+        model["layout_emissions"]["context"][layout_name] = {}
+        model["layout_emissions"]["progress"][layout_name] = {}
+        for intent in INTENTS:
+            model["layout_emissions"]["held"][layout_name][intent] = _normalize_counts(
+                layout_held_emission_counts[layout_name][intent], HELD_BUCKETS, alpha
+            )
+            model["layout_emissions"]["proximity"][layout_name][intent] = _normalize_counts(
+                layout_prox_emission_counts[layout_name][intent], PROX_BUCKETS, alpha
+            )
+            action_support = [str(a) for a in Action.ALL_ACTIONS]
+            model["layout_emissions"]["action"][layout_name][intent] = _normalize_counts(
+                layout_action_counts[layout_name][intent], action_support, alpha
+            )
+            model["layout_emissions"]["context"][layout_name][intent] = _normalize_counts(
+                layout_context_emission_counts[layout_name][intent],
+                CONTEXT_BUCKETS,
+                alpha,
+            )
+            model["layout_emissions"]["progress"][layout_name][intent] = _normalize_counts(
+                layout_progress_emission_counts[layout_name][intent],
+                PROGRESS_BUCKETS,
+                alpha,
+            )
 
     return model
 
