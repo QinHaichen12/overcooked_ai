@@ -2,10 +2,15 @@ import os
 import sys
 
 # Import and patch the production eventlet server if necessary
+HAS_EVENTLET = False
 if os.getenv("FLASK_ENV", "production") == "production":
-    import eventlet
+    try:
+        import eventlet
 
-    eventlet.monkey_patch()
+        eventlet.monkey_patch()
+        HAS_EVENTLET = True
+    except ImportError:
+        HAS_EVENTLET = False
 
 import atexit
 import json
@@ -34,12 +39,15 @@ from utils import ThreadSafeDict, ThreadSafeSet
 ###########
 
 # Read in global config
-CONF_PATH = os.getenv("CONF_PATH", "config.json")
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+CONF_PATH = os.getenv("CONF_PATH", os.path.join(_SERVER_DIR, "config.json"))
 with open(CONF_PATH, "r") as f:
     CONFIG = json.load(f)
 
 # Where errors will be logged
 LOGFILE = CONFIG["logfile"]
+if not os.path.isabs(LOGFILE):
+    LOGFILE = os.path.join(_SERVER_DIR, LOGFILE)
 
 # Available layout names
 LAYOUTS = CONFIG["layouts"]
@@ -52,6 +60,8 @@ MAX_GAME_LENGTH = CONFIG["MAX_GAME_LENGTH"]
 
 # Path to where pre-trained agents will be stored on server
 AGENT_DIR = CONFIG["AGENT_DIR"]
+if not os.path.isabs(AGENT_DIR):
+    AGENT_DIR = os.path.join(_SERVER_DIR, AGENT_DIR)
 
 # Maximum number of games that can run concurrently. Contrained by available memory and CPU
 MAX_GAMES = CONFIG["MAX_GAMES"]
@@ -108,7 +118,12 @@ game._configure(MAX_GAME_LENGTH, AGENT_DIR)
 # Create and configure flask app
 app = Flask(__name__, template_folder=os.path.join("static", "templates"))
 app.config["DEBUG"] = os.getenv("FLASK_ENV", "production") == "development"
-socketio = SocketIO(app, cors_allowed_origins="*", logger=app.config["DEBUG"])
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    logger=app.config["DEBUG"],
+    async_mode=("eventlet" if HAS_EVENTLET else "threading"),
+)
 
 
 # Attach handler for logging errors to file

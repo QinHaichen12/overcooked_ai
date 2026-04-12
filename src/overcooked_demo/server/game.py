@@ -1,8 +1,10 @@
 import json
+import math
 import os
 import pickle
 import random
 from abc import ABC, abstractmethod
+from collections import deque
 from queue import Empty, Full, LifoQueue, Queue
 from threading import Lock, Thread
 from time import time
@@ -11,6 +13,7 @@ import ray
 from utils import DOCKER_VOLUME, create_dirs
 
 from human_aware_rl.rllib.rllib import load_agent
+from overcooked_ai_py.agents.agent import RandomAgent
 from overcooked_ai_py.mdp.actions import Action, Direction
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
@@ -41,12 +44,14 @@ def fix_bc_path(path):
     import dill
 
     # the path is the agents/Rllib.*/agent directory
-    agent_path = os.path.dirname(path)
+    agent_path = os.path.abspath(os.path.dirname(path))
     with open(os.path.join(agent_path, "config.pkl"), "rb") as f:
         data = dill.load(f)
     bc_model_dir = data["bc_params"]["bc_config"]["model_dir"]
     last_dir = os.path.basename(bc_model_dir)
-    bc_model_dir = os.path.join(agent_path, "bc_params", last_dir)
+    bc_model_dir = os.path.abspath(
+        os.path.join(agent_path, "bc_params", last_dir)
+    )
     data["bc_params"]["bc_config"]["model_dir"] = bc_model_dir
     with open(os.path.join(agent_path, "config.pkl"), "wb") as f:
         dill.dump(data, f)
@@ -672,20 +677,36 @@ class OvercookedGame(Game):
         return obj_dict
 
     def get_policy(self, npc_id, idx=0):
+        if npc_id.lower() in [
+            "bayesianbeliefai",
+            "bayesbeliefai",
+            "bayesianhelperai",
+        ]:
+            return BayesianBeliefAI(
+                agent_index=idx, mdp_getter=lambda: self.mdp
+            )
+
         if npc_id.lower().startswith("rllib"):
             try:
                 # Loading rllib agents requires additional helpers
-                fpath = os.path.join(AGENT_DIR, npc_id, "agent")
+                fpath = os.path.abspath(
+                    os.path.join(AGENT_DIR, npc_id, "agent")
+                )
                 fix_bc_path(fpath)
                 agent = load_agent(fpath, agent_index=idx)
                 return agent
             except Exception as e:
-                raise IOError(
-                    "Error loading Rllib Agent\n{}".format(e.__repr__())
+                print(
+                    "Warning: failed to load {0} ({1}). Falling back to RandAI.".format(
+                        npc_id, e
+                    )
                 )
+                return RandomAgent(all_actions=Action.ALL_ACTIONS)
         else:
             try:
-                fpath = os.path.join(AGENT_DIR, npc_id, "agent.pickle")
+                fpath = os.path.abspath(
+                    os.path.join(AGENT_DIR, npc_id, "agent.pickle")
+                )
                 with open(fpath, "rb") as f:
                     return pickle.load(f)
             except Exception as e:
@@ -798,6 +819,1084 @@ class DummyOvercookedGame(OvercookedGame):
 
     def get_policy(self, *args, **kwargs):
         return DummyAI()
+
+
+class BayesianBeliefAI:
+    """
+    A lightweight cooperative agent that maintains a Bayesian belief over
+    the human partner's intent and picks complementary tasks.
+
+    This implementation is intentionally simple and fast enough for live demo
+    play without RLlib dependencies.
+    """
+
+    INTENTS = [
+        "get_onion",
+        "get_tomato",
+        "get_dish",
+        "put_in_pot",
+        "start_cooking",
+        "pickup_soup",
+        "deliver_soup",
+    ]
+
+    def __init__(
+        self,
+        agent_index=1,
+        mdp_getter=None,
+        model_path=None,
+        use_model_likelihood=True,
+        use_transition_prior=True,
+        use_commitment=True,
+        use_yield=True,
+    ):
+        self.agent_index = agent_index
+        self.mdp_getter = mdp_getter
+        self.model = self._load_model(model_path)
+        self.use_model_likelihood = use_model_likelihood
+        self.use_transition_prior = use_transition_prior
+        self.use_commitment = use_commitment
+        self.use_yield = use_yield
+        self.reset()
+
+    def reset(self):
+        p = 1.0 / len(self.INTENTS)
+        self.intent_belief = {intent: p for intent in self.INTENTS}
+        self.intent_history = deque(maxlen=8)
+        self._prev_human_obs = None
+        self.handoff_role = "none"
+
+    def set_agent_index(self, agent_index):
+        self.agent_index = agent_index
+
+    def set_mdp(self, mdp):
+        self._eval_mdp = mdp
+        if self.mdp_getter is None:
+            self.mdp_getter = lambda: self._eval_mdp
+
+    def action(self, state):
+        mdp = self.mdp_getter() if self.mdp_getter else None
+        if mdp is None:
+            return Action.STAY, None
+
+        layout_name = mdp.mdp_params.get("layout_name", "")
+        human_idx = 1 - self.agent_index
+        self._update_intent_belief(state, mdp, human_idx, layout_name)
+        intent = max(self.intent_belief, key=self.intent_belief.get)
+        self.intent_history.append(intent)
+
+        commitment = self._commitment_strength()
+        if self.use_commitment and commitment >= 0.7 and len(self.intent_history) >= 4:
+            counts = {}
+            for i in self.intent_history:
+                counts[i] = counts.get(i, 0) + 1
+            intent = max(counts, key=counts.get)
+
+        action = self._choose_cooperative_action(
+            state, mdp, intent, dict(self.intent_belief)
+        )
+        info = {
+            "belief": dict(self.intent_belief),
+            "inferred_intent": intent,
+            "intent_commitment": commitment,
+            "handoff_role": self.handoff_role,
+        }
+        return action, info
+
+    def _update_intent_belief(self, state, mdp, human_idx, layout_name):
+        human = state.players[human_idx]
+        observed_action = self._infer_observed_action(self._prev_human_obs, human)
+        likelihood = self._heuristic_likelihood(state, mdp, human)
+
+        if self.model and self.use_model_likelihood:
+            model_likelihood = self._model_likelihood(
+                state, mdp, human, layout_name, observed_action
+            )
+            for intent in self.INTENTS:
+                likelihood[intent] = (
+                    0.6 * model_likelihood[intent] + 0.4 * likelihood[intent]
+                )
+
+        prior = self._transition_prior(layout_name)
+
+        eps = 1e-6
+        unnorm = {}
+        for intent in self.INTENTS:
+            unnorm[intent] = prior[intent] * (likelihood[intent] + eps)
+        z = sum(unnorm.values())
+        if z <= 0:
+            p = 1.0 / len(self.INTENTS)
+            self.intent_belief = {intent: p for intent in self.INTENTS}
+            return
+
+        posterior = {intent: unnorm[intent] / z for intent in self.INTENTS}
+        u = 1.0 / len(self.INTENTS)
+        self.intent_belief = {
+            intent: 0.9 * posterior[intent] + 0.1 * u for intent in self.INTENTS
+        }
+        self._prev_human_obs = self._snapshot_player_state(human)
+
+    def _heuristic_likelihood(self, state, mdp, human):
+        likelihood = {intent: 0.10 for intent in self.INTENTS}
+        pot_states = mdp.get_pot_states(state)
+        has_ready_or_cooking = bool(pot_states["ready"] or pot_states["cooking"])
+
+        if human.has_object():
+            obj_name = human.get_object().name
+            if obj_name in ["onion", "tomato"]:
+                likelihood["put_in_pot"] = 0.75
+            elif obj_name == "dish":
+                likelihood["pickup_soup"] = 0.70
+            elif obj_name == "soup":
+                likelihood["deliver_soup"] = 0.85
+        else:
+            if self._is_near_any(human.position, mdp.get_onion_dispenser_locations()):
+                likelihood["get_onion"] = 0.65
+            if self._is_near_any(human.position, mdp.get_tomato_dispenser_locations()):
+                likelihood["get_tomato"] = 0.65
+            if self._is_near_any(human.position, mdp.get_dish_dispenser_locations()):
+                likelihood["get_dish"] = 0.65
+            if has_ready_or_cooking and self._is_near_any(
+                human.position, mdp.get_pot_locations()
+            ):
+                likelihood["start_cooking"] = 0.55
+        return likelihood
+
+    def _transition_prior(self, layout_name):
+        if not self.model or not self.use_transition_prior:
+            return dict(self.intent_belief)
+
+        layout_priors = self.model.get("layout_priors", {}).get(layout_name, {})
+        layout_transitions = self.model.get("layout_transitions", {}).get(layout_name, {})
+        if layout_priors and layout_transitions:
+            prior_source = layout_priors
+            transition_source = layout_transitions
+        else:
+            group = self._layout_group(layout_name)
+            prior_source = self.model.get("priors", {}).get(group, {})
+            transition_source = self.model.get("transitions", {}).get(group, {})
+
+        prior = {}
+        for dst in self.INTENTS:
+            t_prob = 0.0
+            for src in self.INTENTS:
+                row = transition_source.get(src, {})
+                t_prob += self.intent_belief[src] * row.get(dst, 0.0)
+            prior[dst] = 0.5 * prior_source.get(dst, 1.0 / len(self.INTENTS)) + 0.5 * t_prob
+
+        z = sum(prior.values())
+        if z <= 0:
+            p = 1.0 / len(self.INTENTS)
+            return {intent: p for intent in self.INTENTS}
+        return {k: v / z for k, v in prior.items()}
+
+    def _model_likelihood(self, state, mdp, human, layout_name, observed_action=None):
+        del layout_name  # reserved for future layout-specific emissions
+        emissions = self.model.get("emissions", {}) if self.model else {}
+        held_probs = emissions.get("held", {})
+        prox_probs = emissions.get("proximity", {})
+        action_probs = emissions.get("action", {})
+
+        held_bucket = self._held_bucket(human)
+        prox_bucket = self._proximity_bucket(human, mdp)
+        action_key = str(observed_action) if observed_action is not None else None
+
+        likelihood = {}
+        for intent in self.INTENTS:
+            p_held = held_probs.get(intent, {}).get(held_bucket, 1e-3)
+            p_prox = prox_probs.get(intent, {}).get(prox_bucket, 1e-3)
+            p_action = 1.0
+            if action_key is not None:
+                p_action = action_probs.get(intent, {}).get(action_key, 1e-3)
+            likelihood[intent] = max(1e-6, p_held * p_prox * math.sqrt(p_action))
+
+        z = sum(likelihood.values())
+        if z <= 0:
+            p = 1.0 / len(self.INTENTS)
+            return {intent: p for intent in self.INTENTS}
+        return {k: v / z for k, v in likelihood.items()}
+
+    def _held_bucket(self, player):
+        if not player.has_object():
+            return "none"
+        obj_name = player.get_object().name
+        if obj_name in ["onion", "tomato", "dish", "soup"]:
+            return obj_name
+        return "other"
+
+    def _snapshot_player_state(self, player):
+        held_name = None
+        if player.has_object():
+            held_name = player.get_object().name
+        return {
+            "position": player.position,
+            "orientation": player.orientation,
+            "held": held_name,
+        }
+
+    def _infer_observed_action(self, prev_obs, player):
+        if prev_obs is None:
+            return None
+
+        curr_pos = player.position
+        curr_orient = player.orientation
+        curr_held = None if not player.has_object() else player.get_object().name
+
+        prev_pos = prev_obs["position"]
+        prev_orient = prev_obs["orientation"]
+        prev_held = prev_obs["held"]
+
+        if curr_pos != prev_pos:
+            dx = curr_pos[0] - prev_pos[0]
+            dy = curr_pos[1] - prev_pos[1]
+            step = (dx, dy)
+            if step in Direction.ALL_DIRECTIONS:
+                return step
+
+        if curr_orient != prev_orient and curr_orient in Direction.ALL_DIRECTIONS:
+            return curr_orient
+
+        if curr_held != prev_held:
+            return Action.INTERACT
+
+        return Action.STAY
+
+    def _proximity_bucket(self, player, mdp):
+        pos = player.position
+        if self._is_near_any(pos, mdp.get_onion_dispenser_locations()):
+            return "onion"
+        if self._is_near_any(pos, mdp.get_tomato_dispenser_locations()):
+            return "tomato"
+        if self._is_near_any(pos, mdp.get_dish_dispenser_locations()):
+            return "dish"
+        if self._is_near_any(pos, mdp.get_pot_locations()):
+            return "pot"
+        if self._is_near_any(pos, mdp.get_serving_locations()):
+            return "serve"
+        return "none"
+
+    def _layout_group(self, layout_name):
+        lname = layout_name.lower()
+        for token in [
+            "cramped",
+            "corridor",
+            "forced",
+            "counter_circuit",
+            "you_shall_not_pass",
+            "bottleneck",
+        ]:
+            if token in lname:
+                return "constrained"
+        return "open"
+
+    def _commitment_strength(self):
+        if not self.intent_history:
+            return 0.0
+        counts = {}
+        for intent in self.intent_history:
+            counts[intent] = counts.get(intent, 0) + 1
+        return max(counts.values()) / float(len(self.intent_history))
+
+    def _load_model(self, model_path):
+        candidates = []
+        if model_path:
+            candidates.append(model_path)
+
+        env_path = os.getenv("OVERCOOKED_BAYESIAN_MODEL")
+        if env_path:
+            candidates.append(env_path)
+
+        if AGENT_DIR:
+            candidates.append(
+                os.path.join(AGENT_DIR, "BayesianBeliefAI", "model.pkl")
+            )
+
+        for path in candidates:
+            try:
+                if not path:
+                    continue
+                abs_path = os.path.abspath(path)
+                if not os.path.exists(abs_path):
+                    continue
+                with open(abs_path, "rb") as f:
+                    data = pickle.load(f)
+                if isinstance(data, dict) and "intents" in data:
+                    print("Loaded Bayesian model from {}".format(abs_path))
+                    return data
+            except Exception as e:
+                print("Warning: failed to load Bayesian model {} ({})".format(path, e))
+
+        return None
+
+    def _choose_cooperative_action(self, state, mdp, human_intent, intent_belief=None):
+        me = state.players[self.agent_index]
+        human = state.players[1 - self.agent_index]
+        layout_name = mdp.mdp_params.get("layout_name", "")
+        pot_states = mdp.get_pot_states(state)
+        ready_pots = list(pot_states["ready"])
+        cooking_pots = list(pot_states["cooking"])
+        ready_or_cooking = ready_pots + cooking_pots
+        full_not_cooking = pot_states.get("3_items", [])
+        intent_belief = intent_belief or {}
+        human_serving = self._human_on_serving_duty(human, human_intent, mdp)
+        dish_urgent = self._should_prepare_dish_now(
+            state,
+            mdp,
+            me,
+            human,
+            human_intent,
+            ready_pots,
+            cooking_pots,
+        )
+
+        unblock_action = self._unblock_human_deadend(mdp, me, human)
+        if unblock_action is not None:
+            return unblock_action
+
+        serving_unblock_action = self._unblock_human_serving_lane(state, mdp, me, human)
+        if serving_unblock_action is not None:
+            return serving_unblock_action
+
+        handoff_action = self._constrained_handoff_action(
+            state, mdp, me, human, layout_name
+        )
+        if handoff_action is not None:
+            return handoff_action
+
+        ingredient_prob = sum(
+            intent_belief.get(k, 0.0)
+            for k in ["get_onion", "get_tomato", "put_in_pot", "start_cooking"]
+        )
+        delivery_prob = sum(
+            intent_belief.get(k, 0.0)
+            for k in ["get_dish", "pickup_soup", "deliver_soup"]
+        )
+
+        if ready_or_cooking:
+            if me.has_object():
+                held = me.get_object().name
+                if held == "soup":
+                    return self._go_interact_with(mdp, me, mdp.get_serving_locations())
+                if held == "dish":
+                    if ready_pots:
+                        return self._go_interact_with(mdp, me, ready_pots)
+                    if dish_urgent and (not human_serving):
+                        return self._go_interact_with(mdp, me, cooking_pots)
+                    return self._drop_held_object_for_handoff(state, mdp, me, human)
+                if held in ["onion", "tomato"]:
+                    return self._drop_held_object_for_handoff(state, mdp, me, human)
+
+            if ready_pots:
+                if human_serving and len(ready_pots) <= 1:
+                    needed = self._needed_ingredient_for_best_pot(state, mdp)
+                    if needed == "tomato":
+                        return self._go_interact_with(
+                            mdp, me, mdp.get_tomato_dispenser_locations()
+                        )
+                    return self._go_interact_with(
+                        mdp, me, mdp.get_onion_dispenser_locations()
+                    )
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+
+            if dish_urgent and (not human_serving):
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+
+            needed = self._needed_ingredient_for_best_pot(state, mdp)
+            if needed == "tomato":
+                return self._go_interact_with(mdp, me, mdp.get_tomato_dispenser_locations())
+            return self._go_interact_with(mdp, me, mdp.get_onion_dispenser_locations())
+
+        if full_not_cooking:
+            pot = min(full_not_cooking, key=lambda p: self._manhattan(me.position, p))
+            d_me = self._manhattan(me.position, pot)
+            d_human = self._manhattan(human.position, pot)
+            if (not me.has_object()) and d_me <= d_human:
+                return self._go_interact_with(mdp, me, [pot])
+            if me.has_object() and me.get_object().name in ["onion", "tomato"]:
+                return self._drop_held_object_for_handoff(state, mdp, me, human)
+
+        if self.use_yield and self._should_yield_to_human(
+            state, me, human, human_intent, mdp
+        ):
+            return Action.STAY
+
+        if me.has_object():
+            held = me.get_object().name
+            if held in ["onion", "tomato"]:
+                pots = self._candidate_pots_for_ingredient(state, mdp, held)
+                if not pots:
+                    return self._drop_held_object_for_handoff(state, mdp, me, human)
+                return self._go_interact_with(mdp, me, pots)
+            if held == "dish":
+                if ready_or_cooking:
+                    return self._go_interact_with(mdp, me, ready_or_cooking)
+                return self._drop_held_object_for_handoff(state, mdp, me, human)
+            if held == "soup":
+                return self._go_interact_with(mdp, me, mdp.get_serving_locations())
+
+        if ingredient_prob >= delivery_prob + 0.05:
+            if ready_pots:
+                if (not human_serving) or len(ready_pots) > 1:
+                    return self._go_interact_with(
+                        mdp, me, mdp.get_dish_dispenser_locations()
+                    )
+            elif cooking_pots and dish_urgent and (not human_serving):
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+
+            needed = self._needed_ingredient_for_best_pot(state, mdp)
+            if needed == "tomato":
+                return self._go_interact_with(mdp, me, mdp.get_tomato_dispenser_locations())
+            return self._go_interact_with(mdp, me, mdp.get_onion_dispenser_locations())
+
+        if delivery_prob > ingredient_prob + 0.05:
+            if full_not_cooking:
+                return self._go_interact_with(mdp, me, full_not_cooking)
+            needed = self._needed_ingredient_for_best_pot(state, mdp)
+            if needed == "tomato":
+                return self._go_interact_with(mdp, me, mdp.get_tomato_dispenser_locations())
+            return self._go_interact_with(mdp, me, mdp.get_onion_dispenser_locations())
+
+        if full_not_cooking:
+            return self._go_interact_with(mdp, me, full_not_cooking)
+        if ready_pots:
+            if (not human_serving) or len(ready_pots) > 1:
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+        elif cooking_pots and dish_urgent and (not human_serving):
+            return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+
+        return self._go_interact_with(mdp, me, mdp.get_onion_dispenser_locations())
+
+    def _human_on_serving_duty(self, human, human_intent, mdp=None):
+        if human.has_object():
+            held = human.get_object().name
+            if held in ["dish", "soup"]:
+                return True
+
+        if human_intent not in ["get_dish", "pickup_soup", "deliver_soup"]:
+            return False
+
+        if mdp is None:
+            return True
+
+        targets = (
+            mdp.get_dish_dispenser_locations()
+            + mdp.get_pot_locations()
+            + mdp.get_serving_locations()
+        )
+        if not targets:
+            return False
+
+        d_human = min(self._manhattan(human.position, t) for t in targets)
+        return d_human <= 2
+
+    def _should_prepare_dish_now(
+        self,
+        state,
+        mdp,
+        me,
+        human,
+        human_intent,
+        ready_pots,
+        cooking_pots,
+    ):
+        if ready_pots:
+            return True
+        if not cooking_pots:
+            return False
+
+        soonest_ready = None
+        for pot in cooking_pots:
+            if not state.has_object(pot):
+                continue
+            soup = state.get_object(pot)
+            if not getattr(soup, "is_cooking", False):
+                continue
+            remaining = getattr(soup, "cook_time_remaining", None)
+            if remaining is None:
+                continue
+            if soonest_ready is None or remaining < soonest_ready:
+                soonest_ready = remaining
+
+        if soonest_ready is None:
+            return False
+
+        dish_dist = self._min_interaction_distance(
+            mdp, me.position, mdp.get_dish_dispenser_locations()
+        )
+        pot_dist = self._min_interaction_distance(mdp, me.position, cooking_pots)
+        if dish_dist is None or pot_dist is None:
+            travel_est = 8
+        else:
+            travel_est = dish_dist + pot_dist
+
+        if self._human_on_serving_duty(human, human_intent, mdp) and soonest_ready > 1:
+            return False
+
+        return soonest_ready <= max(4, min(12, travel_est + 3))
+
+    def _constrained_handoff_action(self, state, mdp, me, human, layout_name):
+        if self._layout_group(layout_name) != "constrained":
+            self.handoff_role = "none"
+            return None
+
+        role = self._infer_handoff_role(mdp, me)
+        if role == "none":
+            self.handoff_role = "none"
+            return None
+
+        self.handoff_role = role
+        shared_counters = self._shared_handoff_counters(state, mdp, me, human)
+        if not shared_counters:
+            return None
+
+        pot_states = mdp.get_pot_states(state)
+        ready_or_cooking = pot_states["ready"] + pot_states["cooking"]
+        full_not_cooking = pot_states.get("3_items", [])
+
+        counter_objs = mdp.get_counter_objects_dict(state, counter_subset=shared_counters)
+        empty_shared = [c for c in shared_counters if not state.has_object(c)]
+        needed_ing = self._needed_ingredient_for_best_pot(state, mdp)
+
+        if role == "giver":
+            if me.has_object():
+                held = me.get_object().name
+                if held in ["onion", "tomato", "dish"]:
+                    if empty_shared:
+                        return self._go_interact_with(mdp, me, empty_shared)
+                    return self._go_near_features(mdp, me, shared_counters)
+                if held == "soup":
+                    return self._go_interact_with(mdp, me, mdp.get_serving_locations())
+                if empty_shared:
+                    return self._go_interact_with(mdp, me, empty_shared)
+                return Action.STAY
+
+            need_dish = bool(ready_or_cooking) and not counter_objs.get("dish")
+            if need_dish and self._can_interact_with_any(
+                mdp, me, mdp.get_dish_dispenser_locations()
+            ):
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+
+            source = (
+                mdp.get_tomato_dispenser_locations()
+                if needed_ing == "tomato"
+                else mdp.get_onion_dispenser_locations()
+            )
+            if self._can_interact_with_any(mdp, me, source):
+                return self._go_interact_with(mdp, me, source)
+
+            if self._can_interact_with_any(mdp, me, mdp.get_dish_dispenser_locations()):
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+
+            return self._go_near_features(mdp, me, shared_counters)
+
+        if me.has_object():
+            held = me.get_object().name
+            if held == "soup":
+                return self._go_interact_with(mdp, me, mdp.get_serving_locations())
+            if held == "dish":
+                if ready_or_cooking:
+                    return self._go_interact_with(mdp, me, ready_or_cooking)
+                if full_not_cooking:
+                    return self._go_interact_with(mdp, me, full_not_cooking)
+                return self._go_near_features(mdp, me, shared_counters)
+            if held in ["onion", "tomato"]:
+                pots = self._candidate_pots_for_ingredient(state, mdp, held)
+                if pots:
+                    return self._go_interact_with(mdp, me, pots)
+                if full_not_cooking:
+                    return self._go_interact_with(mdp, me, full_not_cooking)
+                if empty_shared:
+                    return self._go_interact_with(mdp, me, empty_shared)
+                return Action.STAY
+
+        if full_not_cooking:
+            return self._go_interact_with(mdp, me, full_not_cooking)
+
+        if ready_or_cooking:
+            dish_positions = list(counter_objs.get("dish", []))
+            if dish_positions:
+                return self._go_interact_with(mdp, me, dish_positions)
+            if self._can_interact_with_any(mdp, me, mdp.get_dish_dispenser_locations()):
+                return self._go_interact_with(mdp, me, mdp.get_dish_dispenser_locations())
+            return self._go_near_features(mdp, me, shared_counters)
+
+        preferred_obj = "tomato" if needed_ing == "tomato" else "onion"
+        preferred_positions = list(counter_objs.get(preferred_obj, []))
+        if preferred_positions:
+            return self._go_interact_with(mdp, me, preferred_positions)
+
+        alt_obj = "onion" if preferred_obj == "tomato" else "tomato"
+        alt_positions = list(counter_objs.get(alt_obj, []))
+        if alt_positions:
+            return self._go_interact_with(mdp, me, alt_positions)
+
+        source = (
+            mdp.get_tomato_dispenser_locations()
+            if preferred_obj == "tomato"
+            else mdp.get_onion_dispenser_locations()
+        )
+        if self._can_interact_with_any(mdp, me, source):
+            return self._go_interact_with(mdp, me, source)
+
+        return self._go_near_features(mdp, me, shared_counters)
+
+    def _infer_handoff_role(self, mdp, player):
+        can_onion = self._can_interact_with_any(
+            mdp, player, mdp.get_onion_dispenser_locations()
+        )
+        can_tomato = self._can_interact_with_any(
+            mdp, player, mdp.get_tomato_dispenser_locations()
+        )
+        can_dish = self._can_interact_with_any(
+            mdp, player, mdp.get_dish_dispenser_locations()
+        )
+        can_pot = self._can_interact_with_any(mdp, player, mdp.get_pot_locations())
+        can_serve = self._can_interact_with_any(
+            mdp, player, mdp.get_serving_locations()
+        )
+
+        supply_score = int(can_onion) + int(can_tomato) + int(can_dish)
+        cook_score = int(can_pot) + int(can_serve)
+
+        if supply_score > 0 and cook_score == 0:
+            return "giver"
+        if cook_score > 0 and supply_score == 0:
+            return "receiver"
+        return "none"
+
+    def _shared_handoff_counters(self, state, mdp, me, human):
+        counters = mdp.get_counter_locations()
+        ranked = []
+        for c in counters:
+            if state.has_object(c):
+                me_d = self._min_interaction_distance(mdp, me.position, [c])
+                human_d = self._min_interaction_distance(mdp, human.position, [c])
+                if me_d is None or human_d is None:
+                    continue
+                ranked.append((me_d + human_d - 0.25, c))
+                continue
+
+            me_d = self._min_interaction_distance(mdp, me.position, [c])
+            human_d = self._min_interaction_distance(mdp, human.position, [c])
+            if me_d is None or human_d is None:
+                continue
+            ranked.append((me_d + human_d, c))
+
+        ranked.sort(key=lambda x: x[0])
+        return [c for _, c in ranked]
+
+    def _unblock_human_deadend(self, mdp, me, human):
+        valid = set(mdp.get_valid_player_positions())
+        human_pos = human.position
+        if human_pos not in valid:
+            return None
+
+        neighbors = []
+        for direction in Direction.ALL_DIRECTIONS:
+            nxt = Action.move_in_direction(human_pos, direction)
+            if nxt in valid:
+                neighbors.append(nxt)
+
+        if len(neighbors) != 1:
+            return None
+
+        exit_tile = neighbors[0]
+        if me.position != exit_tile:
+            return None
+
+        best = None
+        for action in Direction.ALL_DIRECTIONS:
+            nxt, _ = mdp._move_if_direction(me.position, me.orientation, action)
+            if nxt == me.position or nxt == human_pos:
+                continue
+
+            score = self._manhattan(nxt, human_pos)
+            if best is None or score > best[0]:
+                best = (score, action)
+
+        return None if best is None else best[1]
+
+    def _unblock_human_serving_lane(self, state, mdp, me, human):
+        if not human.has_object() or human.get_object().name != "soup":
+            return None
+
+        if me.has_object() and me.get_object().name == "soup":
+            return None
+
+        serving_locations = mdp.get_serving_locations()
+        if not serving_locations:
+            return None
+
+        human_goal = self._closest_reachable_interaction_goal(
+            mdp, human.position, serving_locations
+        )
+        if human_goal is None:
+            return None
+
+        _, human_target_pos, _ = human_goal
+        human_next_action = self._first_action_on_shortest_path(
+            mdp, human.position, human_target_pos
+        )
+        human_next_pos = (
+            Action.move_in_direction(human.position, human_next_action)
+            if human_next_action in Direction.ALL_DIRECTIONS
+            else human.position
+        )
+
+        blocking_now = me.position == human_target_pos or me.position == human_next_pos
+        if not blocking_now:
+            return None
+
+        serving_goal_positions = {
+            pos for pos, _ in self._interaction_goals(mdp, serving_locations)
+        }
+
+        best = None
+        for action in Direction.ALL_DIRECTIONS:
+            nxt, _ = mdp._move_if_direction(me.position, me.orientation, action)
+            if nxt == me.position or nxt == human.position:
+                continue
+            if nxt == human_next_pos:
+                continue
+
+            score = self._manhattan(nxt, human.position)
+            if nxt not in serving_goal_positions:
+                score += 3
+            if best is None or score > best[0]:
+                best = (score, action)
+
+        return None if best is None else best[1]
+
+    def _can_interact_with_any(self, mdp, player, feature_positions):
+        return (
+            self._closest_reachable_interaction_goal(
+                mdp, player.position, feature_positions
+            )
+            is not None
+        )
+
+    def _min_interaction_distance(self, mdp, start_pos, feature_positions):
+        best = self._closest_reachable_interaction_goal(
+            mdp, start_pos, feature_positions
+        )
+        return None if best is None else best[0]
+
+    def _closest_reachable_interaction_goal(self, mdp, start_pos, feature_positions):
+        goals = self._interaction_goals(mdp, feature_positions)
+        if not goals:
+            return None
+
+        best = None
+        for target_pos, target_or in goals:
+            dist = self._shortest_path_distance(mdp, start_pos, target_pos)
+            if dist is None:
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, target_pos, target_or)
+        return best
+
+    def _go_near_features(self, mdp, player, feature_positions):
+        best = self._closest_reachable_interaction_goal(
+            mdp, player.position, feature_positions
+        )
+        if best is None:
+            return Action.STAY
+
+        _, target_pos, target_or = best
+        if player.position == target_pos:
+            if player.orientation == target_or:
+                return Action.STAY
+            return target_or
+
+        return self._step_towards(mdp, player.position, player.orientation, target_pos)
+
+    def _drop_held_object_for_handoff(self, state, mdp, me, human):
+        counters = mdp.get_empty_counter_locations(state)
+        if not counters:
+            return Action.STAY
+
+        near_human = [
+            c for c in counters if self._manhattan(c, human.position) <= 2
+        ]
+        targets = near_human if near_human else counters
+        return self._go_interact_with(mdp, me, targets)
+
+    def _should_yield_to_human(self, state, me, human, human_intent, mdp):
+        if not self.use_commitment:
+            return False
+
+        if self._commitment_strength() < 0.75:
+            return False
+
+        if self._manhattan(me.position, human.position) > 2:
+            return False
+
+        pot_states = mdp.get_pot_states(state)
+        open_pots = (
+            list(pot_states["empty"])
+            + list(pot_states["1_items"])
+            + list(pot_states["2_items"])
+        )
+        if open_pots:
+            if (not me.has_object()) or (
+                me.has_object() and me.get_object().name in ["onion", "tomato"]
+            ):
+                return False
+
+        if human_intent == "get_dish":
+            targets = mdp.get_dish_dispenser_locations()
+        elif human_intent in ["deliver_soup", "pickup_soup"]:
+            targets = mdp.get_serving_locations() + mdp.get_pot_locations()
+        else:
+            targets = mdp.get_pot_locations()
+
+        if not targets:
+            return False
+
+        d_me = min(self._manhattan(me.position, t) for t in targets)
+        d_human = min(self._manhattan(human.position, t) for t in targets)
+        return d_human < d_me and d_human <= 2 and d_me <= 3
+
+    def _needed_ingredient_for_best_pot(self, state, mdp):
+        target_order = self._select_target_recipe(state, mdp)
+        if target_order is None:
+            return "onion"
+
+        target = list(target_order.ingredients)
+        target_onion = target.count("onion")
+        target_tomato = target.count("tomato")
+
+        pot_positions = mdp.get_pot_locations()
+        best_missing = None
+        best_score = -math.inf
+
+        for pos in pot_positions:
+            onion_count = 0
+            tomato_count = 0
+            if state.has_object(pos):
+                soup = state.get_object(pos)
+                if soup.is_cooking or soup.is_ready:
+                    continue
+                onion_count = soup.ingredients.count("onion")
+                tomato_count = soup.ingredients.count("tomato")
+
+            missing_onion = max(0, target_onion - onion_count)
+            missing_tomato = max(0, target_tomato - tomato_count)
+            overflow = max(0, onion_count - target_onion) + max(
+                0, tomato_count - target_tomato
+            )
+            fill_score = onion_count + tomato_count - 2 * overflow
+
+            if missing_onion <= 0 and missing_tomato <= 0:
+                continue
+
+            if fill_score > best_score:
+                best_score = fill_score
+                best_missing = "onion" if missing_onion >= missing_tomato else "tomato"
+
+        return best_missing or ("onion" if target_onion >= target_tomato else "tomato")
+
+    def _candidate_pots_for_ingredient(self, state, mdp, ingredient_name):
+        target_order = self._select_target_recipe(state, mdp)
+        target_onion = None
+        target_tomato = None
+        if target_order is not None:
+            target = list(target_order.ingredients)
+            target_onion = target.count("onion")
+            target_tomato = target.count("tomato")
+
+        pots = []
+        fallback = []
+        for pos in mdp.get_pot_locations():
+            if not state.has_object(pos):
+                pots.append(pos)
+                fallback.append(pos)
+                continue
+            soup = state.get_object(pos)
+            if soup.is_cooking or soup.is_ready or soup.is_full:
+                continue
+
+            fallback.append(pos)
+
+            if target_order is None:
+                pots.append(pos)
+                continue
+
+            onion_count = soup.ingredients.count("onion")
+            tomato_count = soup.ingredients.count("tomato")
+
+            if onion_count > target_onion or tomato_count > target_tomato:
+                continue
+
+            if ingredient_name == "onion" and onion_count >= target_onion:
+                continue
+            if ingredient_name == "tomato" and tomato_count >= target_tomato:
+                continue
+
+            pots.append(pos)
+
+        return pots if pots else fallback
+
+    def _select_target_recipe(self, state, mdp):
+        recipes = list(state.all_orders)
+        if not recipes:
+            return None
+
+        pot_positions = mdp.get_pot_locations()
+        best_recipe = None
+        best_score = -math.inf
+
+        for recipe in recipes:
+            ingredients = list(recipe.ingredients)
+            target_onion = ingredients.count("onion")
+            target_tomato = ingredients.count("tomato")
+            target_total = target_onion + target_tomato
+
+            reward = float(mdp.get_recipe_value(state, recipe))
+            cook_time = float(getattr(recipe, "time", 20) or 20)
+            throughput = reward / max(1.0, cook_time)
+
+            best_pot_fit = -float(target_total)
+            for pos in pot_positions:
+                if not state.has_object(pos):
+                    pot_fit = 0.0
+                else:
+                    soup = state.get_object(pos)
+                    if soup.is_cooking or soup.is_ready:
+                        pot_fit = 3.0 if soup.recipe == recipe else -2.0
+                    else:
+                        onion_count = soup.ingredients.count("onion")
+                        tomato_count = soup.ingredients.count("tomato")
+                        matching = min(onion_count, target_onion) + min(
+                            tomato_count, target_tomato
+                        )
+                        extra = max(0, onion_count - target_onion) + max(
+                            0, tomato_count - target_tomato
+                        )
+                        missing = target_total - matching
+                        pot_fit = 2.0 * matching - 2.5 * extra - 0.5 * missing
+
+                if pot_fit > best_pot_fit:
+                    best_pot_fit = pot_fit
+
+            score = 2.0 * throughput + 0.1 * reward + best_pot_fit
+            if recipe in state.bonus_orders:
+                score += 0.5
+
+            if score > best_score:
+                best_score = score
+                best_recipe = recipe
+
+        return best_recipe
+
+    def _go_interact_with(self, mdp, player, feature_positions):
+        best = self._closest_reachable_interaction_goal(
+            mdp, player.position, feature_positions
+        )
+        if best is None:
+            return Action.STAY
+
+        _, target_pos, target_or = best
+
+        if player.position == target_pos:
+            if player.orientation == target_or:
+                return Action.INTERACT
+            return target_or
+
+        return self._step_towards(mdp, player.position, player.orientation, target_pos)
+
+    def _shortest_path_distance(self, mdp, start_pos, target_pos):
+        if start_pos == target_pos:
+            return 0
+
+        valid = set(mdp.get_valid_player_positions())
+        if start_pos not in valid or target_pos not in valid:
+            return None
+
+        frontier = deque([(start_pos, 0)])
+        seen = {start_pos}
+
+        while frontier:
+            curr, dist = frontier.popleft()
+            for action in Direction.ALL_DIRECTIONS:
+                nxt = Action.move_in_direction(curr, action)
+                if nxt not in valid or nxt in seen:
+                    continue
+                if nxt == target_pos:
+                    return dist + 1
+                seen.add(nxt)
+                frontier.append((nxt, dist + 1))
+
+        return None
+
+    def _step_towards(self, mdp, pos, orient, target_pos):
+        bfs_action = self._first_action_on_shortest_path(mdp, pos, target_pos)
+        if bfs_action is not None:
+            return bfs_action
+
+        best_action = Action.STAY
+        best_dist = self._manhattan(pos, target_pos)
+        for action in Direction.ALL_DIRECTIONS:
+            next_pos, _ = mdp._move_if_direction(pos, orient, action)
+            dist = self._manhattan(next_pos, target_pos)
+            if dist < best_dist:
+                best_dist = dist
+                best_action = action
+        return best_action
+
+    def _first_action_on_shortest_path(self, mdp, start_pos, target_pos):
+        if start_pos == target_pos:
+            return Action.STAY
+
+        valid = set(mdp.get_valid_player_positions())
+        if start_pos not in valid or target_pos not in valid:
+            return None
+
+        frontier = deque([start_pos])
+        parent = {start_pos: None}
+
+        while frontier:
+            curr = frontier.popleft()
+            if curr == target_pos:
+                break
+            for action in Direction.ALL_DIRECTIONS:
+                nxt = Action.move_in_direction(curr, action)
+                if nxt not in valid or nxt in parent:
+                    continue
+                parent[nxt] = (curr, action)
+                frontier.append(nxt)
+
+        if target_pos not in parent:
+            return None
+
+        node = target_pos
+        first_action = None
+        while parent[node] is not None:
+            prev, action = parent[node]
+            first_action = action
+            node = prev
+        return first_action
+
+    def _interaction_goals(self, mdp, feature_positions):
+        valid = set(mdp.get_valid_player_positions())
+        goals = []
+        for fx, fy in feature_positions:
+            for d in Direction.ALL_DIRECTIONS:
+                px, py = Action.move_in_direction((fx, fy), d)
+                if (px, py) in valid:
+                    goals.append(((px, py), Direction.OPPOSITE_DIRECTIONS[d]))
+        return goals
+
+    @staticmethod
+    def _manhattan(a, b):
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    @staticmethod
+    def _is_near_any(pos, targets, dist=1):
+        for t in targets:
+            if abs(pos[0] - t[0]) + abs(pos[1] - t[1]) <= dist:
+                return True
+        return False
 
 
 class DummyAI:

@@ -1,8 +1,10 @@
 import os
 from threading import Lock
 
-# this is the mounted volume
-DOCKER_VOLUME = "/app/data"
+DOCKER_VOLUME = os.getenv(
+    "OVERCOOKED_DATA_DIR",
+    "/app/data" if os.path.isdir("/app") else os.path.abspath("data"),
+)
 
 
 class ThreadSafeSet(set):
