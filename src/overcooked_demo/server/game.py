@@ -12,6 +12,13 @@ from time import time
 import ray
 from utils import DOCKER_VOLUME, create_dirs
 
+from human_aware_rl.human.intent_model_utils import (
+    build_intent_feature_state,
+    feature_state_key,
+    q_values_for_state,
+    snapshot_player_state as snapshot_intent_player_state,
+    softmax_distribution,
+)
 from human_aware_rl.rllib.rllib import load_agent
 from overcooked_ai_py.agents.agent import RandomAgent
 from overcooked_ai_py.mdp.actions import Action, Direction
@@ -685,6 +692,13 @@ class OvercookedGame(Game):
             return BayesianBeliefAI(
                 agent_index=idx, mdp_getter=lambda: self.mdp
             )
+
+        if npc_id.lower() in [
+            "rlintentmodelai",
+            "rlintentai",
+            "reinforcementintentai",
+        ]:
+            return RLIntentModelAI(agent_index=idx, mdp_getter=lambda: self.mdp)
 
         if npc_id.lower().startswith("rllib"):
             try:
@@ -1897,6 +1911,129 @@ class BayesianBeliefAI:
             if abs(pos[0] - t[0]) + abs(pos[1] - t[1]) <= dist:
                 return True
         return False
+
+
+class RLIntentModelAI(BayesianBeliefAI):
+    """
+    Cooperative helper that predicts human intent with a learned tabular RL model
+    and then reuses the Bayesian helper's task-complementing control logic.
+    """
+
+    def __init__(
+        self,
+        agent_index=1,
+        mdp_getter=None,
+        model_path=None,
+        temperature=0.35,
+        use_commitment=True,
+        use_yield=True,
+    ):
+        self.temperature = temperature
+        self._prev_predicted_intent = "none"
+        super(RLIntentModelAI, self).__init__(
+            agent_index=agent_index,
+            mdp_getter=mdp_getter,
+            model_path=model_path,
+            use_model_likelihood=False,
+            use_transition_prior=False,
+            use_commitment=use_commitment,
+            use_yield=use_yield,
+        )
+
+    def reset(self):
+        super(RLIntentModelAI, self).reset()
+        self._prev_predicted_intent = "none"
+
+    def action(self, state):
+        mdp = self.mdp_getter() if self.mdp_getter else None
+        if mdp is None:
+            return Action.STAY, None
+
+        layout_name = mdp.mdp_params.get("layout_name", "")
+        human_idx = 1 - self.agent_index
+        self._update_intent_belief(state, mdp, human_idx, layout_name)
+        intent = max(self.intent_belief, key=self.intent_belief.get)
+        self.intent_history.append(intent)
+
+        commitment = self._commitment_strength()
+        if self.use_commitment and commitment >= 0.7 and len(self.intent_history) >= 4:
+            counts = {}
+            for i in self.intent_history:
+                counts[i] = counts.get(i, 0) + 1
+            intent = max(counts, key=counts.get)
+        self._prev_predicted_intent = intent
+
+        action = self._choose_cooperative_action(
+            state, mdp, intent, dict(self.intent_belief)
+        )
+        info = {
+            "belief": dict(self.intent_belief),
+            "inferred_intent": intent,
+            "intent_commitment": commitment,
+            "handoff_role": self.handoff_role,
+            "policy_source": "tabular_q",
+        }
+        return action, info
+
+    def _load_model(self, model_path):
+        candidates = []
+        if model_path:
+            candidates.append(model_path)
+
+        env_path = os.getenv("OVERCOOKED_RL_INTENT_MODEL")
+        if env_path:
+            candidates.append(env_path)
+
+        if AGENT_DIR:
+            candidates.append(os.path.join(AGENT_DIR, "RLIntentModelAI", "model.pkl"))
+
+        for path in candidates:
+            try:
+                if not path:
+                    continue
+                abs_path = os.path.abspath(path)
+                if not os.path.exists(abs_path):
+                    continue
+                with open(abs_path, "rb") as f:
+                    data = pickle.load(f)
+                if isinstance(data, dict) and "q_table" in data:
+                    print("Loaded RL intent model from {}".format(abs_path))
+                    return data
+            except Exception as e:
+                print("Warning: failed to load RL intent model {} ({})".format(path, e))
+
+        return None
+
+    def _update_intent_belief(self, state, mdp, human_idx, layout_name):
+        human = state.players[human_idx]
+        feature_state = build_intent_feature_state(
+            state,
+            mdp,
+            human_idx,
+            prev_human_obs=self._prev_human_obs,
+            prev_intent=self._prev_predicted_intent,
+            layout_name=layout_name,
+        )
+        state_key = feature_state_key(feature_state)
+        q_table = {} if not self.model else self.model.get("q_table", {})
+        policy_table = {} if not self.model else self.model.get("policy_table", {})
+
+        if state_key in policy_table:
+            probs = policy_table[state_key]
+        elif state_key in q_table:
+            q_values = q_values_for_state(q_table, state_key)
+            probs = softmax_distribution(
+                q_values, self.INTENTS, temperature=self.temperature
+            )
+        else:
+            probs = self._heuristic_likelihood(state, mdp, human)
+
+        uniform = 1.0 / len(self.INTENTS)
+        self.intent_belief = {
+            intent: 0.9 * float(probs.get(intent, 0.0)) + 0.1 * uniform
+            for intent in self.INTENTS
+        }
+        self._prev_human_obs = snapshot_intent_player_state(human)
 
 
 class DummyAI:
