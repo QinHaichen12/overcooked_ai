@@ -147,26 +147,20 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         pickup_counter_objects = self._filter_reserved_counter_objects(raw_counter_objects)
 
         pot_states = mdp.get_pot_states(state)
+
         ready_pots = list(pot_states["ready"])
         cooking_pots = list(pot_states["cooking"])
-        full_not_cooking = list(mdp.get_full_but_not_cooking_pots(pot_states))
-        fillable_pots = list(pot_states["empty"]) + list(
-            mdp.get_partially_full_pots(pot_states)
-        )
-        
-        # Debug: show actual ingredient counts for all pots
-        all_pot_positions = list(mdp.get_pot_locations())
-        print(f"[DEBUG] _analyze_state: pot ingredient details (all {len(all_pot_positions)} pots):")
-        for pot_pos in all_pot_positions:
-            if state.has_object(pot_pos):
-                soup = state.get_object(pot_pos)
-                ingredients = getattr(soup, "ingredients", [])
-                is_cooking = getattr(soup, "is_cooking", False)
-                print(f"[DEBUG]   pot {pot_pos}: ingredients={len(ingredients)}, is_cooking={is_cooking}")
-            else:
-                print(f"[DEBUG]   pot {pot_pos}: NO OBJECT (stale)")
-        
-        print(f"[DEBUG] _analyze_state: mdp classification: cooking={len(cooking_pots)}, fillable={len(fillable_pots)}, ready={len(ready_pots)}, full_not_cooking={len(full_not_cooking)}")
+
+        # Use MDP classification exactly like the greedy agent
+        target_counts = self._target_recipe_counts(state)
+        target_total = target_counts["onion"] + target_counts["tomato"]
+        soups_ready_to_cook_key = f"{target_total}_items"
+
+        full_not_cooking = list(pot_states.get(soups_ready_to_cook_key, []))
+
+        fillable_pots = list(pot_states["empty"])
+        for k in ["1_items", "2_items"]:
+            fillable_pots.extend(list(pot_states.get(k, [])))
 
         handoff_counters = self._shared_handoff_counters(state, player, partner)
         self.handoff_role = self._infer_handoff_role(player)
@@ -177,11 +171,9 @@ class StateAwarePlanningAgent(GreedyHumanModel):
             shared_counter_objects
         )
 
-        # Soonest cook_time_remaining across all active cooking pots
         soonest_ready = None
         for pot_pos in cooking_pots:
             if not state.has_object(pot_pos):
-                print(f"[DEBUG] _analyze_state: cooking pot at {pot_pos} has no object (stale)")
                 continue
             soup = state.get_object(pot_pos)
             remaining = getattr(soup, "cook_time_remaining", None)
@@ -195,9 +187,7 @@ class StateAwarePlanningAgent(GreedyHumanModel):
             "player": player,
             "partner": partner,
             "player_object": player.get_object().name if player.has_object() else None,
-            "partner_object": (
-                partner.get_object().name if partner.has_object() else None
-            ),
+            "partner_object": partner.get_object().name if partner.has_object() else None,
             "pot_states": pot_states,
             "ready_pots": ready_pots,
             "cooking_pots": cooking_pots,
@@ -217,16 +207,11 @@ class StateAwarePlanningAgent(GreedyHumanModel):
             "handoff_role": self.handoff_role,
             "shared_counter_objects": shared_counter_objects,
             "pickup_shared_counter_objects": pickup_shared_counter_objects,
-            "target_counts": self._target_recipe_counts(state),
+            "target_counts": target_counts,
+            "soups_ready_to_cook_key": soups_ready_to_cook_key,
         }
 
-        # dish_urgent: is it time to get a dish right now?
         analysis["dish_urgent"] = self._is_dish_urgent(analysis)
-        
-        print(f"[DEBUG] _analyze_state: handoff_role={self.handoff_role}, "
-              f"handoff_counters={len(handoff_counters)}, "
-              f"empty_counters={len(analysis['empty_drop_counters'])}")
-        
         return analysis
 
     def _is_dish_urgent(self, analysis):
@@ -268,87 +253,6 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         # Both reachable (open layout): use full round-trip estimate.
         travel_estimate = dish_dist + pot_dist
         return analysis["soonest_ready"] <= travel_estimate + self.DISH_PREP_BUFFER
-
-    # ── Workflow identification helpers ────────────────────────────────────────
-
-    def _current_workflow_phase(self, analysis):
-        """
-        Identify what phase of the cooking workflow we're in.
-        
-        Returns: "serve" | "prep" | "idle"
-        
-        - SERVE: ready pots exist or soups on counter (must service immediately)
-        - PREP: fillable pots exist and NO active cooking/ready (should fill pots)
-        - IDLE: no pots at all or all pots cooking but we just served
-        """
-        if analysis["ready_pots"] or analysis["counter_soups"]:
-            return "serve"
-        
-        if analysis["cooking_pots"]:
-            # Cooking pots exist, but check if we also have fillable
-            # If we have both, we're in "prep while serving" (ambiguous)
-            # Default to serve-priority
-            return "serve"
-        
-        if analysis["fillable_pots"]:
-            return "prep"
-        
-        return "idle"
-
-    def _should_fetch_dish(self, analysis):
-        """
-        Explicit identification: should we fetch a dish right now?
-        
-        Returns: (should_fetch: bool, reason: str, urgency: str)
-        
-        - urgency is "critical" (serve now), "preemptive" (pot almost done), or "none"
-        """
-        # Critical: soup is ready or on counter
-        if analysis["ready_pots"]:
-            return (True, f"ready_pots={len(analysis['ready_pots'])}", "critical")
-        if analysis["counter_soups"]:
-            return (True, f"counter_soups={len(analysis['counter_soups'])}", "critical")
-        
-        # Preemptive: cooking pots exist and time is urgent
-        if analysis["cooking_pots"] and self._is_dish_urgent(analysis):
-            return (True, f"cooking_pots={len(analysis['cooking_pots'])}, dish_urgent=True", "preemptive")
-        
-        return (False, "no ready pots, no counter soup, no urgent cooking", "none")
-
-    def _should_fetch_ingredient(self, analysis):
-        """
-        Explicit identification: should we fetch an ingredient right now?
-        
-        Returns: (should_fetch: bool, ingredient: str|None, reason: str)
-        
-        Should NOT fetch ingredients if:
-        - We're in serve phase (pots cooking or ready)
-        - All fillable pots are unreachable
-        - Partner is already holding/fetching ingredients
-        """
-        # Don't fetch if no fillable pots exist
-        if not analysis["fillable_pots"]:
-            return (False, None, "no_fillable_pots")
-        
-        # Don't fetch if we're in serve phase (cooking/ready pots exist)
-        # In serve phase, giver should stage dishes, not ingredients
-        if analysis["cooking_pots"] or analysis["ready_pots"] or analysis["counter_soups"]:
-            return (False, None, "in_serve_phase")
-        
-        # Don't fetch if partner is already holding ingredients (avoid duplication)
-        if analysis["partner_object"] in ["onion", "tomato"]:
-            return (False, None, f"partner_holding_{analysis['partner_object']}")
-        
-        # Don't fetch if partner is holding a dish (they will be scooping soon)
-        if analysis["partner_object"] == "dish":
-            return (False, None, "partner_holding_dish")
-        
-        # Select which ingredient to fetch
-        ingredient = self._select_prepare_ingredient(analysis)
-        if ingredient is None:
-            return (False, None, "pot_already_full")
-        
-        return (True, ingredient, f"fillable_pots={len(analysis['fillable_pots'])}, need_{ingredient}")
 
     # ── Planner 1: handle held object ────────────────────────────────────────
 
@@ -442,94 +346,47 @@ class StateAwarePlanningAgent(GreedyHumanModel):
 
         print(f"[DEBUG]   _plan_dish_in_hand: no case matched, returning None")
         return None
-
+    
     def _plan_ingredient_in_hand(self, state, analysis, ingredient):
         """
-        Holding an ingredient (onion/tomato).
-
-        1. If ALL pots are now cooking/ready (no fillable pot left), this
-           ingredient is useless right now.  Drop it somewhere OTHER than the
-           handoff counter so the counter stays free for a dish to pass through.
-        2. Put directly in a pot that needs it (open layouts).
-        3. If pot is unreachable, drop on handoff counter for partner.
-        4. Last resort: drop anywhere to free hands.
+        Greedy-style ingredient handling:
+        1. If pot is already full/cooking/ready and no fillable pots remain, drop ingredient.
+        2. Otherwise try to put ingredient directly into a valid pot using MLAM's pot-state logic.
+        3. If unreachable, relay via handoff.
+        4. Last resort: drop anywhere.
         """
-        pot_active = bool(analysis["cooking_pots"] or analysis["ready_pots"])
-        no_fillable = not analysis["fillable_pots"]
-
-        # DEBUG
-        print(f"[DEBUG] _plan_ingredient_in_hand: ingredient={ingredient}, "
-              f"pot_active={pot_active}, no_fillable={no_fillable}, "
-              f"fillable_pots={len(analysis['fillable_pots'])}, "
-              f"cooking={len(analysis['cooking_pots'])}, "
-              f"ready={len(analysis['ready_pots'])}")
-
-        # Case 1: pot is cooking/done and no pot needs more filling.
-        # Drop the ingredient OFF the handoff counter so it stays clear for
-        # a dish. Use any non-handoff empty counter.
-        if pot_active and no_fillable:
-            handoff_set = set(analysis["handoff_counters"])
-            non_handoff_empty = [
-                pos for pos in analysis["empty_drop_counters"]
-                if pos not in handoff_set
-            ]
-            print(f"[DEBUG]   Case 1 triggered: non_handoff_empty={len(non_handoff_empty)}")
-            
-            if non_handoff_empty:
-                print(f"[DEBUG]     -> dropping on non-handoff counter")
+        if not analysis["fillable_pots"]:
+            drop_goals = self._drop_motion_goals(state, analysis)
+            if drop_goals:
                 return self._decision(
-                    "drop_{}_away_from_handoff".format(ingredient),
-                    self.PREP_ROLE,
-                    self._motion_goals_for_positions(non_handoff_empty),
+                    f"drop_{ingredient}_to_clear", self.PREP_ROLE, drop_goals
                 )
-            # Nowhere else — try using any counter, but DON'T return None here.
-            # Fall through to Case 3 and 4 instead.
-            print(f"[DEBUG]     -> no non-handoff empty, will try handoff/any drop")
+            return None
 
-        # Case 2: direct pot deposit (BUT ONLY IF REACHABLE)
         put_goals = self._ingredient_put_motion_goals(analysis, ingredient)
         if put_goals:
-            print(f"[DEBUG]   Case 2: generated put_goals={len(put_goals)}, checking reachability...")
-            # Verify these goals are actually reachable from current position
             player = analysis["player"]
             reachable_put_goals = self._filter_valid_motion_goals(player, put_goals)
             if reachable_put_goals:
-                print(f"[DEBUG]     -> reachable_put_goals={len(reachable_put_goals)}, RETURNING")
                 return self._decision(
-                    "put_{}_in_pot".format(ingredient), self.PREP_ROLE, put_goals
+                    f"put_{ingredient}_in_pot", self.PREP_ROLE, put_goals
                 )
-            else:
-                print(f"[DEBUG]     -> reachable_put_goals=0, FALLING THROUGH to handoff")
 
-        # Case 3: relay via handoff counter
         relay_goals = self._empty_handoff_goals(analysis)
         if relay_goals:
-            print(f"[DEBUG]   Case 3: relay goals={len(relay_goals)}")
             player = analysis["player"]
             reachable_relay = self._filter_valid_motion_goals(player, relay_goals)
             if reachable_relay:
-                print(f"[DEBUG]     -> reachable relay, RETURNING")
                 return self._decision(
-                    "drop_{}_for_partner".format(ingredient), self.PREP_ROLE, relay_goals
+                    f"drop_{ingredient}_for_partner", self.PREP_ROLE, relay_goals
                 )
-            else:
-                print(f"[DEBUG]     -> relay unreachable, trying Case 4")
 
-        # Case 4: drop anywhere to clear hands
         drop_goals = self._drop_motion_goals(state, analysis)
         if drop_goals:
-            print(f"[DEBUG]   Case 4: drop_goals={len(drop_goals)}, checking reachability...")
-            player = analysis["player"]
-            reachable_drop = self._filter_valid_motion_goals(player, drop_goals)
-            if reachable_drop:
-                print(f"[DEBUG]     -> reachable drop, RETURNING")
-                return self._decision(
-                    "drop_{}_to_clear".format(ingredient), self.PREP_ROLE, drop_goals
-                )
-            else:
-                print(f"[DEBUG]     -> drop also unreachable")
+            return self._decision(
+                f"drop_{ingredient}_to_clear", self.PREP_ROLE, drop_goals
+            )
 
-        print(f"[DEBUG]   NO CASE matched! Returning None")
         return None
 
     # ── Planner 2: serve ready soup ───────────────────────────────────────────
@@ -542,26 +399,20 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         - Counter soup: try to pick it up directly (mlam handles needing a dish).
         - Ready pot: fetch a dish so we can scoop soup.
         """
-        # Use explicit need identification
-        should_fetch_dish, reason, urgency = self._should_fetch_dish(analysis)
-        
         # Soup sitting on a counter is the most time-sensitive — grab it first.
         if analysis["counter_soups"]:
             soup_goals = self.mlam.pickup_counter_soup_actions(
                 analysis["pickup_counter_objects"]
             )
             if soup_goals:
-                print(f"[DEBUG] _plan_service: picking up counter soup")
                 return self._decision(
                     "pickup_counter_soup", self.SERVE_ROLE, soup_goals
                 )
 
         if not (analysis["counter_soups"] or analysis["ready_pots"]):
-            print(f"[DEBUG] _plan_service: no soups to serve")
             return None
 
         # Get a dish to scoop from the ready pot.
-        print(f"[DEBUG] _plan_service: fetching dish for ready pot (urgency={urgency})")
         dish_goals = self.mlam.pickup_dish_actions(analysis["pickup_counter_objects"])
         if dish_goals:
             return self._decision("get_dish_ready_pot", self.SERVE_ROLE, dish_goals)
@@ -584,41 +435,17 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         A pot is cooking and will be ready within DISH_PREP_BUFFER + travel time.
         Fetch a dish proactively so we do not stand idle after soup is done.
 
-        But: only fetch if we don't already have enough dishes staged for the
-        number of cooking pots. Max 1 dish per cooking pot + 1 buffer.
-
         Skip if:
-        - dish is not urgent (too early — focus on prep work instead)
-        - partner is already holding a dish or soup (they'll handle it)
-        - we already have enough dishes staged
+        - dish_urgent is False (too early — focus on prep work instead)
+        - partner is already heading for / holding a dish or soup
         """
-        # Use explicit need identification
-        should_fetch_dish, reason, urgency = self._should_fetch_dish(analysis)
-        
-        if urgency != "preemptive" or not analysis["cooking_pots"]:
+        if not analysis["dish_urgent"] or not analysis["cooking_pots"]:
             return None
 
         # Don't send both players after a dish at the same time.
         if analysis["partner_object"] in ("dish", "soup"):
-            print(f"[DEBUG] _plan_dish_for_pot: skipping (partner has {analysis['partner_object']})")
             return None
 
-        # Check if we already have enough dishes available (including on counter)
-        cooking_count = len(analysis["cooking_pots"])
-        available_dishes = (
-            len(analysis["pickup_counter_objects"]["dish"]) +
-            len(analysis["pickup_shared_counter_objects"]["dish"])
-        )
-        
-        # Max dishes to have available: 1 per cooking pot + 1 buffer
-        max_dishes_available = cooking_count + 1
-        
-        if available_dishes >= max_dishes_available:
-            print(f"[DEBUG] _plan_dish_for_pot: skipping (available={available_dishes}, max={max_dishes_available})")
-            return None
-
-        print(f"[DEBUG] _plan_dish_for_pot: fetching preemptively (reason={reason}, available={available_dishes}, max={max_dishes_available})")
-        
         dish_goals = self.mlam.pickup_dish_actions(analysis["pickup_counter_objects"])
         if dish_goals:
             return self._decision("get_dish_preemptive", self.SERVE_ROLE, dish_goals)
@@ -636,32 +463,18 @@ class StateAwarePlanningAgent(GreedyHumanModel):
     # ── Planner 4: start cooking ──────────────────────────────────────────────
 
     def _plan_start_cooking(self, state, analysis):
-        """A pot is full (exactly 3 items) and hasn't started cooking — go press the button."""
-        if not analysis["full_not_cooking"]:
+        truly_full = [
+            pot_pos
+            for pot_pos in analysis["full_not_cooking"]
+            if self._pot_is_exactly_ready_to_cook(analysis, pot_pos)
+        ]
+
+        if not truly_full:
             return None
 
-        # Validate that each pot truly has 3 ingredients before starting
-        validated_pots = []
-        for pot_pos in analysis["full_not_cooking"]:
-            # Check if object still exists at this position
-            if not state.has_object(pot_pos):
-                print(f"[DEBUG] _plan_start_cooking: pot_pos {pot_pos} no longer has object (stale)")
-                continue
-            
-            soup = state.get_object(pot_pos)
-            if hasattr(soup, 'ingredients') and len(soup.ingredients) == 3:
-                validated_pots.append(pot_pos)
-            else:
-                num_items = len(soup.ingredients) if hasattr(soup, 'ingredients') else 0
-                print(f"[DEBUG] _plan_start_cooking: SKIPPING pot at {pot_pos} (only {num_items} ingredients)")
-
-        if not validated_pots:
-            print(f"[DEBUG] _plan_start_cooking: no valid pots (all failed ingredient count check)")
-            return None
-
-        print(f"[DEBUG] _plan_start_cooking: cooking {len(validated_pots)} pots")
         full_pots = defaultdict(list)
-        full_pots["3_items"] = validated_pots
+        full_pots[analysis["soups_ready_to_cook_key"]] = truly_full
+
         start_goals = self.mlam.start_cooking_actions(full_pots)
         if start_goals:
             return self._decision("start_cooking", self.PREP_ROLE, start_goals)
@@ -672,62 +485,32 @@ class StateAwarePlanningAgent(GreedyHumanModel):
 
     def _plan_fill_pot(self, state, analysis):
         """
-        A pot needs ingredients. Choose the right ingredient type and fetch it.
-        Also checks shared counters for items already placed by partner.
-        
-        NOTE: Skip if pots are already full (3 items) — those belong with _plan_start_cooking.
+        Fill pots using MDP pot-state classification.
+        If a pot is already in '<target_total>_items', do not keep filling — let
+        _plan_start_cooking handle it first.
         """
+        if analysis["full_not_cooking"]:
+            return None
+
         if not analysis["fillable_pots"]:
             return None
 
-        # Verify that fillable pots really need filling (not already full by mistake)
-        validated_fillable = []
-        for pot_pos in analysis["fillable_pots"]:
-            # Check if soup object still exists at this position
-            if not state.has_object(pot_pos):
-                print(f"[DEBUG] _plan_fill_pot: pot_pos {pot_pos} no longer has object (stale)")
-                continue
-            
-            soup = state.get_object(pot_pos)
-            if hasattr(soup, 'ingredients'):
-                num_items = len(soup.ingredients)
-                if num_items < 3:  # Only fill if pot is NOT yet full
-                    validated_fillable.append(pot_pos)
-                elif num_items == 3:
-                    print(f"[DEBUG] _plan_fill_pot: pot at {pot_pos} is FULL (3 items), should be cooking not fillable")
-
-        if not validated_fillable:
-            print(f"[DEBUG] _plan_fill_pot: no pots to fill (all full or error)")
-            return None
-
-        # Temporarily override fillable_pots to only include validated ones
-        original_fillable = analysis["fillable_pots"]
-        analysis["fillable_pots"] = validated_fillable
-        
         ingredient = self._select_prepare_ingredient(analysis)
-        
-        # Restore original list
-        analysis["fillable_pots"] = original_fillable
-        
         if ingredient is None:
             return None
 
-        print(f"[DEBUG] _plan_fill_pot: fetching {ingredient} for pot(s) {validated_fillable}")
-
-        # Ingredient at a dispenser or on any accessible counter
         ingredient_goals = self._pickup_ingredient_motion_goals(
             ingredient, analysis["pickup_counter_objects"]
         )
         if ingredient_goals:
             return self._decision(
-                "get_{}".format(ingredient), self.PREP_ROLE, ingredient_goals
+                f"get_{ingredient}", self.PREP_ROLE, ingredient_goals
             )
 
-        # Ingredient pre-staged by partner on the shared handoff counter
         shared = list(analysis["pickup_shared_counter_objects"].get(ingredient, []))
         if shared:
             return self._decision(
-                "get_shared_{}".format(ingredient),
+                f"get_shared_{ingredient}",
                 self.PREP_ROLE,
                 self._motion_goals_for_positions(shared),
             )
@@ -800,12 +583,16 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         """
         Giver: figure out what the receiver will need next and stage it.
 
-        Smart workflow-based decision using explicit need identification:
-          - Priority A: Stage dishes if receiver will need them (cooking/ready pots)
-          - Priority B: Stage ingredients if receiver will need them (fillable pots, no cooking)
-          - Only stage if not already staged and doesn't exceed need cap
+        The decision is based on the receiver's most urgent upcoming action:
 
-        Also: only stage one type at a time to avoid cluttering the counter.
+          pot is cooking or ready  →  receiver needs a DISH  →  fetch a dish
+          pot is fillable          →  receiver needs an INGREDIENT  →  fetch it
+
+        When both are true (e.g. one pot cooking, another fillable), cooking
+        takes priority so the receiver can serve soup without waiting.
+
+        Also: only stage one item at a time.  If the counter already has the
+        right item, hold off — don't clutter the counter.
         """
         empty_handoff = [
             pos
@@ -813,58 +600,33 @@ class StateAwarePlanningAgent(GreedyHumanModel):
             if pos in set(analysis["empty_drop_counters"])
         ]
         if not empty_handoff:
-            print(f"[DEBUG] _plan_giver_prefetch: handoff counter full")
             return None  # Counter full — wait for partner to clear it.
 
-        # Use explicit need identification for both dish and ingredient
-        should_fetch_dish, dish_reason, dish_urgency = self._should_fetch_dish(analysis)
-        should_fetch_ingredient, ingredient, ingredient_reason = self._should_fetch_ingredient(analysis)
-        
         shared = analysis["pickup_shared_counter_objects"]
-        cooking_count = len(analysis["cooking_pots"])
-        fillable_count = len(analysis["fillable_pots"])
-        staged_dishes = len(shared["dish"])
-        staged_onions = len(shared["onion"])
-        staged_tomatoes = len(shared["tomato"])
-        
-        # VALIDATION: Check if cooking pots are actually valid (have 3 ingredients)
-        # If MDP says a pot is cooking but it's not full, don't trust cooking_count
-        validated_cooking_count = 0
-        for pot_pos in analysis["cooking_pots"]:
-            if state.has_object(pot_pos):
-                soup = state.get_object(pot_pos)
-                ingr_count = len(getattr(soup, "ingredients", []))
-                if ingr_count == 3:  # Only count as valid cooking if truly full
-                    validated_cooking_count += 1
+        pot_active = bool(analysis["cooking_pots"] or analysis["ready_pots"])
 
-        print(f"[DEBUG] _plan_giver_prefetch: cooking={cooking_count} (validated={validated_cooking_count}), fillable={fillable_count}, "
-              f"staged_dish={staged_dishes}, should_fetch_dish={should_fetch_dish} (urgency={dish_urgency}), should_fetch_ingredient={should_fetch_ingredient}")
-
-        # ── Priority A: Dishes for cooking/ready pots ─────────────────────────
-        if should_fetch_dish and dish_urgency in ["critical", "preemptive"]:
-            # Only stage dishes if cooking pots are actually VALID (3 ingredients)
-            max_dishes_to_stage = min(validated_cooking_count + 1, 3)
-            if staged_dishes < max_dishes_to_stage:
-                print(f"[DEBUG]   staging dish ({dish_reason}, urgency={dish_urgency}, valid_cooking={validated_cooking_count})")
-                dish_goals = self.mlam.pickup_dish_actions(
-                    analysis["pickup_counter_objects"]
+        # ── Priority A: receiver needs a dish ────────────────────────────────
+        # Triggered when any pot is cooking or ready, regardless of timer.
+        # The giver's job is to pre-stage the dish; receiver decides when to
+        # collect it based on the cooking timer.
+        if pot_active and not shared["dish"]:
+            dish_goals = self.mlam.pickup_dish_actions(
+                analysis["pickup_counter_objects"]
+            )
+            if dish_goals:
+                return self._decision(
+                    "giver_fetch_dish_for_partner", self.SERVE_ROLE, dish_goals
                 )
-                if dish_goals:
-                    return self._decision(
-                        "giver_fetch_dish_for_partner", self.SERVE_ROLE, dish_goals
-                    )
-            else:
-                print(f"[DEBUG]   already have enough dishes staged (staged={staged_dishes}, max={max_dishes_to_stage})")
+
+        # Dish already staged — giver should wait, not fetch another item.
+        if pot_active:
             return None
 
-        # ── Priority B: Ingredients for fillable pots ──────────────────────────
-        # Only reached when should NOT fetch dish
-        if should_fetch_ingredient and ingredient is not None:
-            staged_count = staged_onions if ingredient == "onion" else staged_tomatoes
-            max_ingredients_to_stage = 2
-            
-            if staged_count < max_ingredients_to_stage:
-                print(f"[DEBUG]   staging {ingredient} ({ingredient_reason})")
+        # ── Priority B: receiver needs an ingredient ──────────────────────────
+        # Only reached when NO pot is currently cooking or ready.
+        if analysis["fillable_pots"]:
+            ingredient = self._select_prepare_ingredient(analysis)
+            if ingredient and not shared[ingredient]:
                 ingredient_goals = self._pickup_ingredient_motion_goals(
                     ingredient, analysis["pickup_counter_objects"]
                 )
@@ -874,13 +636,6 @@ class StateAwarePlanningAgent(GreedyHumanModel):
                         self.PREP_ROLE,
                         ingredient_goals,
                     )
-            else:
-                print(f"[DEBUG]   already have enough {ingredient} staged (staged={staged_count}, max={max_ingredients_to_stage})")
-        else:
-            if should_fetch_ingredient:
-                print(f"[DEBUG]   should fetch ingredient but none selected ({ingredient_reason})")
-            else:
-                print(f"[DEBUG]   should not fetch ingredient ({ingredient_reason})")
 
         return None
 
@@ -925,23 +680,11 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         Motion goals for scooping soup with a dish already in hand.
         Always includes ready pots; includes cooking pots when dish is urgent
         (pot is nearly done — this avoids a wasted round trip).
-        
-        IMPORTANT: For constrained layouts (RECEIVER role), DO NOT include
-        cooking pots — the receiver can't reach them anyway. Only pick up
-        soup from READY pots.
         """
         allowed_pot_states = defaultdict(list)
         allowed_pot_states["ready"] = list(analysis["ready_pots"])
-        
-        # Only include cooking pots if we can actually reach them (open layout)
-        # Receivers in constrained layouts should ONLY pick ready soup
         if analysis["dish_urgent"] and analysis["cooking_pots"]:
-            # Check if we can reach cooking pots (based on handoff_role)
-            if analysis["handoff_role"] != "receiver":
-                # Open layout or giver role — include cooking pots
-                allowed_pot_states["cooking"] = list(analysis["cooking_pots"])
-            # else: receiver role — skip cooking pots, only use ready
-        
+            allowed_pot_states["cooking"] = list(analysis["cooking_pots"])
         return self.mlam.pickup_soup_with_dish_actions(
             allowed_pot_states, only_nearly_ready=True
         )
@@ -949,11 +692,11 @@ class StateAwarePlanningAgent(GreedyHumanModel):
     # ── Ingredient selection ──────────────────────────────────────────────────
 
     def _select_prepare_ingredient(self, analysis):
-        """
-        Choose which ingredient to fetch for the best fillable pot.
-        Accounts for what the partner is already carrying to avoid duplication.
-        Returns 'onion', 'tomato', or None (pot is already full).
-        """
+        target_counts = analysis["target_counts"]
+
+        if target_counts.get("onion", 0) == 3 and target_counts.get("tomato", 0) == 0:
+            return "onion"
+
         best_pot = self._best_fillable_pot(analysis)
         if best_pot is None:
             return None
@@ -962,15 +705,14 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         missing = {
             name: max(
                 0,
-                analysis["target_counts"].get(name, 0) - current_counts.get(name, 0),
+                target_counts.get(name, 0) - current_counts.get(name, 0),
             )
             for name in ["onion", "tomato"]
         }
 
-        # Subtract one for whatever the partner is already carrying
-        partner_object = analysis["partner_object"]
-        if partner_object in missing and missing[partner_object] > 0:
-            missing[partner_object] -= 1
+        # partner_object = analysis["partner_object"]
+        # if partner_object in missing and missing[partner_object] > 0:
+        #     missing[partner_object] -= 1
 
         if missing["tomato"] > missing["onion"]:
             return "tomato"
@@ -980,6 +722,13 @@ class StateAwarePlanningAgent(GreedyHumanModel):
             return "tomato"
         return None
 
+    def _pot_is_exactly_ready_to_cook(self, analysis, pot_pos):
+        counts = self._pot_ingredient_counts(analysis["state"], pot_pos)
+        return (
+            counts["onion"] == analysis["target_counts"].get("onion", 0)
+            and counts["tomato"] == analysis["target_counts"].get("tomato", 0)
+        )
+        
     def _best_fillable_pot(self, analysis):
         """
         Score fillable pots and return the position of the best one.
@@ -1042,12 +791,12 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         ]
 
     def _ingredient_put_motion_goals(self, analysis, ingredient_name):
-        target_pots = self._pot_positions_missing_ingredient(analysis, ingredient_name)
-        print(f"[DEBUG]         Case 2: _ingredient_put: ingredient={ingredient_name}, "
-              f"target_pots={target_pots}")
-        if not target_pots:
-            return []
-        return self._motion_goals_for_positions(target_pots)
+        """
+        Use MLAM/MDP pot classification directly, like the greedy agent.
+        """
+        if ingredient_name == "tomato":
+            return self.mlam.put_tomato_in_pot_actions(analysis["pot_states"])
+        return self.mlam.put_onion_in_pot_actions(analysis["pot_states"])
 
     def _pickup_ingredient_motion_goals(self, ingredient_name, counter_objects):
         if ingredient_name == "tomato":

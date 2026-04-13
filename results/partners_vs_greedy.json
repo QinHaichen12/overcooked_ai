@@ -1,0 +1,476 @@
+{
+  "config": {
+    "agents": [
+      "state_aware",
+      "greedy",
+      "role_aware"
+    ],
+    "layouts": [
+      "cramped_room",
+      "coordination_ring",
+      "forced_coordination",
+      "counter_circuit_o_1order"
+    ],
+    "episodes": 50,
+    "horizon": 400,
+    "partner": "greedy"
+  },
+  "agents": {
+    "state_aware": {
+      "layouts": {
+        "cramped_room": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 169.2,
+              "std_sparse_return": 11.461239025515521,
+              "ci95_sparse_return": 3.2091469271443462,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 8.459999999999999,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.6357499999999999,
+              "prep_ratio_mean": 0.32665,
+              "serve_ratio_mean": 0.19655
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 180.0,
+              "std_sparse_return": 22.271057451320086,
+              "ci95_sparse_return": 6.235896086369624,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 9.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.5673,
+              "prep_ratio_mean": 0.31695000000000007,
+              "serve_ratio_mean": 0.32159999999999994
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 174.6,
+            "std_sparse_return": 5.400000000000006,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 8.73,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.601525,
+            "prep_ratio_mean": 0.32180000000000003,
+            "serve_ratio_mean": 0.25907499999999994
+          }
+        },
+        "coordination_ring": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.16549999999999998,
+              "prep_ratio_mean": 0.5502000000000001,
+              "serve_ratio_mean": 0.0
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.3325,
+              "prep_ratio_mean": 0.0425,
+              "serve_ratio_mean": 0.0
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 0.0,
+            "std_sparse_return": 0.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.0,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.249,
+            "prep_ratio_mean": 0.29635000000000006,
+            "serve_ratio_mean": 0.0
+          }
+        },
+        "forced_coordination": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.34,
+              "prep_ratio_mean": 0.0,
+              "serve_ratio_mean": 0.0
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.9775,
+              "prep_ratio_mean": 0.5175,
+              "serve_ratio_mean": 0.0
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 0.0,
+            "std_sparse_return": 0.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.0,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.6587500000000001,
+            "prep_ratio_mean": 0.25875,
+            "serve_ratio_mean": 0.0
+          }
+        },
+        "counter_circuit_o_1order": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 24.0,
+              "std_sparse_return": 43.634848458542855,
+              "ci95_sparse_return": 12.217757568391999,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 1.2,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.1004,
+              "prep_ratio_mean": 0.27690000000000003,
+              "serve_ratio_mean": 0.63825
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 55.6,
+              "std_sparse_return": 58.00551697899088,
+              "ci95_sparse_return": 16.241544754117445,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 2.7800000000000002,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.1545,
+              "prep_ratio_mean": 0.7051000000000002,
+              "serve_ratio_mean": 0.16865
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 39.8,
+            "std_sparse_return": 15.8,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 1.9899999999999998,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.12745,
+            "prep_ratio_mean": 0.4910000000000001,
+            "serve_ratio_mean": 0.40345
+          }
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 53.599999999999994,
+        "std_layout_return": 71.72405454239184
+      }
+    },
+    "greedy": {
+      "layouts": {
+        "cramped_room": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 190.8,
+              "std_sparse_return": 9.967948635501688,
+              "ci95_sparse_return": 2.791025617940473,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 9.540000000000001,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.28014999999999995
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 193.2,
+              "std_sparse_return": 11.737120600896967,
+              "ci95_sparse_return": 3.2863937682511506,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 9.66,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.27915
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 192.0,
+            "std_sparse_return": 1.1999999999999886,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 9.6,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.27964999999999995
+          }
+        },
+        "coordination_ring": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.005
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.0075
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 0.0,
+            "std_sparse_return": 0.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.0,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.00625
+          }
+        },
+        "forced_coordination": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.3350000000000001
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.3325
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 0.0,
+            "std_sparse_return": 0.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.0,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.33375000000000005
+          }
+        },
+        "counter_circuit_o_1order": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 12.4,
+              "std_sparse_return": 16.438978070427616,
+              "ci95_sparse_return": 4.602913859719732,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.62,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.023499999999999997
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 15.2,
+              "std_sparse_return": 16.277591959500644,
+              "ci95_sparse_return": 4.55772574866018,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.76,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.024150000000000005
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 13.8,
+            "std_sparse_return": 1.3999999999999995,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.6900000000000001,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.023825
+          }
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 51.45,
+        "std_layout_return": 81.34191723828496
+      }
+    },
+    "role_aware": {
+      "layouts": {
+        "cramped_room": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 199.6,
+              "std_sparse_return": 17.2,
+              "ci95_sparse_return": 4.816,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 9.98,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.4751999999999999,
+              "prep_ratio_mean": 0.38270000000000004,
+              "serve_ratio_mean": 0.6173
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 193.6,
+              "std_sparse_return": 16.218507946170636,
+              "ci95_sparse_return": 4.541182224927777,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 9.68,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.468,
+              "prep_ratio_mean": 0.39940000000000003,
+              "serve_ratio_mean": 0.6005999999999999
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 196.6,
+            "std_sparse_return": 3.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 9.83,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.47159999999999996,
+            "prep_ratio_mean": 0.39105,
+            "serve_ratio_mean": 0.6089499999999999
+          }
+        },
+        "coordination_ring": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.005,
+              "prep_ratio_mean": 1.0,
+              "serve_ratio_mean": 0.0
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.0075,
+              "prep_ratio_mean": 1.0,
+              "serve_ratio_mean": 0.0
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 0.0,
+            "std_sparse_return": 0.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.0,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.00625,
+            "prep_ratio_mean": 1.0,
+            "serve_ratio_mean": 0.0
+          }
+        },
+        "forced_coordination": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.34,
+              "prep_ratio_mean": 0.0,
+              "serve_ratio_mean": 1.0
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 0.0,
+              "std_sparse_return": 0.0,
+              "ci95_sparse_return": 0.0,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 0.0,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.3374999999999999,
+              "prep_ratio_mean": 1.0,
+              "serve_ratio_mean": 0.0
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 0.0,
+            "std_sparse_return": 0.0,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 0.0,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.33875,
+            "prep_ratio_mean": 0.5,
+            "serve_ratio_mean": 0.5
+          }
+        },
+        "counter_circuit_o_1order": {
+          "by_index": {
+            "0": {
+              "episodes": 50,
+              "mean_sparse_return": 47.2,
+              "std_sparse_return": 20.6920274502041,
+              "ci95_sparse_return": 5.793767686057147,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 2.3600000000000003,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.04965,
+              "prep_ratio_mean": 0.9028,
+              "serve_ratio_mean": 0.09720000000000001
+            },
+            "1": {
+              "episodes": 50,
+              "mean_sparse_return": 114.8,
+              "std_sparse_return": 46.097288423507074,
+              "ci95_sparse_return": 12.90724075858198,
+              "mean_episode_length": 400.0,
+              "estimated_soups_mean": 5.74,
+              "idle_ratio_mean": 0.0,
+              "interact_ratio_mean": 0.1456,
+              "prep_ratio_mean": 0.72245,
+              "serve_ratio_mean": 0.27755
+            }
+          },
+          "aggregate": {
+            "mean_sparse_return": 81.0,
+            "std_sparse_return": 33.8,
+            "mean_episode_length": 400.0,
+            "estimated_soups_mean": 4.05,
+            "idle_ratio_mean": 0.0,
+            "interact_ratio_mean": 0.097625,
+            "prep_ratio_mean": 0.812625,
+            "serve_ratio_mean": 0.187375
+          }
+        }
+      },
+      "aggregate": {
+        "mean_layout_return": 69.4,
+        "std_layout_return": 80.54054879375978
+      }
+    }
+  }
+}
