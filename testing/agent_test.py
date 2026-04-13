@@ -350,6 +350,188 @@ class TestStateAwarePlanningAgent(unittest.TestCase):
         self.assertTrue(motion_goals)
         self.assertEqual(agent.current_task, "drop_dish_for_prep")
 
+    def test_giver_does_not_restage_reserved_onion(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_reserved_onion_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver in forced_coordination
+
+        state = forced_mdp.get_standard_start_state()
+        pot_pos = forced_mdp.get_pot_locations()[0]
+        state.objects[pot_pos] = SoupState.get_soup(pot_pos, num_onions=1)
+        state.objects[(2, 2)] = ObjectState("onion", (2, 2))
+
+        # Simulate reservation memory from a previous onion handoff.
+        agent.counter_handoff_reservation = {
+            "position": (2, 2),
+            "object_name": "onion",
+            "ttl": 3,
+        }
+
+        analysis = agent._analyze_state(state)
+        decision = agent._plan_giver_prefetch(state, analysis)
+
+        self.assertEqual(analysis["handoff_role"], "giver")
+        self.assertIsNone(decision)
+
+    def test_giver_respects_partner_held_onion_pipeline(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_partner_onion_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver
+
+        state = forced_mdp.get_standard_start_state()
+        pot_a, pot_b = forced_mdp.get_pot_locations()
+        state.objects[pot_a] = SoupState.get_soup(pot_a, num_onions=2)
+        state.objects[pot_b] = SoupState.get_soup(
+            pot_b, num_onions=3, cooking_tick=0
+        )
+        state.players[0].set_object(ObjectState("onion", state.players[0].position))
+
+        analysis = agent._analyze_state(state)
+        decision = agent._plan_giver_prefetch(state, analysis)
+
+        self.assertEqual(analysis["handoff_role"], "giver")
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["task"], "giver_fetch_dish_for_partner")
+
+    def test_giver_does_not_fetch_extra_onion_when_partner_has_last_needed_one(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_last_needed_onion_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver
+
+        state = forced_mdp.get_standard_start_state()
+        pot_a, pot_b = forced_mdp.get_pot_locations()
+        state.objects[pot_a] = SoupState.get_soup(pot_a, num_onions=2)
+        state.objects[pot_b] = SoupState.get_soup(pot_b, num_onions=3)
+        state.players[0].set_object(ObjectState("onion", state.players[0].position))
+
+        analysis = agent._analyze_state(state)
+        decision = agent._plan_giver_prefetch(state, analysis)
+
+        self.assertEqual(analysis["handoff_role"], "giver")
+        self.assertIsNone(decision)
+
+    def test_giver_holding_onion_clears_for_dish_when_pipeline_satisfied(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_hold_onion_pipeline_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver
+
+        state = forced_mdp.get_standard_start_state()
+        pot_a, pot_b = forced_mdp.get_pot_locations()
+        state.objects[pot_a] = SoupState.get_soup(pot_a, num_onions=2)
+        state.objects[pot_b] = SoupState.get_soup(
+            pot_b, num_onions=3, cooking_tick=0
+        )
+        state.players[1].set_object(ObjectState("onion", state.players[1].position))
+        state.players[0].set_object(ObjectState("onion", state.players[0].position))
+
+        analysis = agent._analyze_state(state)
+        decision = agent._plan_ingredient_in_hand(state, analysis, "onion")
+
+        self.assertEqual(analysis["handoff_role"], "giver")
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["task"], "drop_onion_clear_for_dish")
+
+    def test_giver_holding_onion_relays_when_pipeline_is_short(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_hold_onion_relay_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver
+
+        state = forced_mdp.get_standard_start_state()
+        pot_a, _ = forced_mdp.get_pot_locations()
+        state.objects[pot_a] = SoupState.get_soup(pot_a, num_onions=2)
+        state.players[1].set_object(ObjectState("onion", state.players[1].position))
+
+        analysis = agent._analyze_state(state)
+        decision = agent._plan_ingredient_in_hand(state, analysis, "onion")
+
+        self.assertEqual(analysis["handoff_role"], "giver")
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["task"], "drop_onion_for_partner")
+
+    def test_held_object_path_does_not_fall_through_to_empty_hand_planners(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_hold_path_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver
+
+        state = forced_mdp.get_standard_start_state()
+        player = state.players[1]
+        player.set_object(ObjectState("dish", player.position))
+        pot_pos = forced_mdp.get_pot_locations()[0]
+        state.objects[pot_pos] = SoupState.get_soup(
+            pot_pos, num_onions=3, cooking_tick=0
+        )
+
+        # Fill the handoff lane so dish relay has no valid destination.
+        for counter_pos in agent.mlam.params["counter_drop"]:
+            state.objects[counter_pos] = ObjectState("onion", counter_pos)
+
+        motion_goals = agent.ml_action(state)
+
+        self.assertTrue(motion_goals)
+        self.assertEqual(agent.current_task, "hold_dish")
+
+    def test_giver_holding_onion_clears_for_dish_when_pot_active(self):
+        forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
+        base_mlam = MediumLevelActionManager.from_pickle_or_compute(
+            forced_mdp,
+            NO_COUNTERS_PARAMS,
+            custom_filename="forced_coordination_state_aware_clear_for_dish_am.pkl",
+            force_compute=force_compute,
+        )
+        agent = StateAwarePlanningAgent(base_mlam)
+        agent.set_agent_index(1)  # Supply-side giver
+
+        state = forced_mdp.get_standard_start_state()
+        player = state.players[1]
+        player.set_object(ObjectState("onion", player.position))
+        pot_pos = forced_mdp.get_pot_locations()[0]
+        state.objects[pot_pos] = SoupState.get_soup(
+            pot_pos, num_onions=3, cooking_tick=0
+        )
+
+        analysis = agent._analyze_state(state)
+        decision = agent._plan_ingredient_in_hand(state, analysis, "onion")
+
+        self.assertEqual(analysis["handoff_role"], "giver")
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["task"], "drop_onion_clear_for_dish")
+
     def test_handoff_reservation_excludes_own_dropped_onion_from_pickup(self):
         forced_mdp = OvercookedGridworld.from_layout_name("forced_coordination")
         base_mlam = MediumLevelActionManager.from_pickle_or_compute(

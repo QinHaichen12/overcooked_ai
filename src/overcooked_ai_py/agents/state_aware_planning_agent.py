@@ -106,8 +106,24 @@ class StateAwarePlanningAgent(GreedyHumanModel):
               f"ready_pots={len(analysis['ready_pots'])}, "
               f"fillable_pots={len(analysis['fillable_pots'])}")
 
+        # Held-object planning is self-contained. Do not fall through into
+        # empty-hand planners, which can create conflicting intents
+        # (e.g. "get_onion" while already holding a dish).
+        if player.has_object():
+            decision = self._plan_held_object(state, analysis)
+            goals = self._apply_decision(player, decision) if decision else None
+            if goals:
+                print(f"[DEBUG]    held_object: SUCCEEDED -> task={decision['task']}")
+                return goals
+
+            self.current_task = f"hold_{held_obj}"
+            self.current_role = (
+                self.SERVE_ROLE if held_obj in ("dish", "soup") else self.PREP_ROLE
+            )
+            print(f"[DEBUG]    held_object: no action -> {self.current_task}")
+            return self._safe_wait_motion_goals(player)
+
         planners = [
-            ("held_object", self._plan_held_object),
             ("service", self._plan_service),
             ("dish_for_pot", self._plan_dish_for_pot),
             ("start_cooking", self._plan_start_cooking),
@@ -254,6 +270,22 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         travel_estimate = dish_dist + pot_dist
         return analysis["soonest_ready"] <= travel_estimate + self.DISH_PREP_BUFFER
 
+    def _giver_needs_dish_handoff(self, analysis):
+        """
+        True when the supply-side giver should prioritize freeing hands
+        to fetch/pass a dish for the receiver.
+        """
+        if analysis["handoff_role"] != "giver":
+            return False
+        # Dish handoff urgency is for service-active pots only.
+        if not (analysis["ready_pots"] or analysis["cooking_pots"]):
+            return False
+        if analysis["partner_object"] in ("dish", "soup"):
+            return False
+        if analysis["shared_counter_objects"]["dish"]:
+            return False
+        return True
+
     # ── Planner 1: handle held object ────────────────────────────────────────
 
     def _plan_held_object(self, state, analysis):
@@ -349,20 +381,16 @@ class StateAwarePlanningAgent(GreedyHumanModel):
     
     def _plan_ingredient_in_hand(self, state, analysis, ingredient):
         """
-        Greedy-style ingredient handling:
-        1. If pot is already full/cooking/ready and no fillable pots remain, drop ingredient.
-        2. Otherwise try to put ingredient directly into a valid pot using MLAM's pot-state logic.
-        3. If unreachable, relay via handoff.
-        4. Last resort: drop anywhere.
+        Streamlined held-ingredient handling:
+        1. Put in pot directly if reachable.
+        2. If giver must pass dishes for active pots, clear hand first.
+        3. If ingredient is still needed and pot is unreachable, relay it.
+        4. Otherwise clear extra ingredient from hand.
         """
-        if not analysis["fillable_pots"]:
-            drop_goals = self._drop_motion_goals(state, analysis)
-            if drop_goals:
-                return self._decision(
-                    f"drop_{ingredient}_to_clear", self.PREP_ROLE, drop_goals
-                )
-            return None
+        is_giver = analysis["handoff_role"] == "giver"
+        needs_dish_handoff = self._giver_needs_dish_handoff(analysis)
 
+        # 1) Direct pot placement always wins.
         put_goals = self._ingredient_put_motion_goals(analysis, ingredient)
         if put_goals:
             player = analysis["player"]
@@ -372,14 +400,68 @@ class StateAwarePlanningAgent(GreedyHumanModel):
                     f"put_{ingredient}_in_pot", self.PREP_ROLE, put_goals
                 )
 
-        relay_goals = self._empty_handoff_goals(analysis)
-        if relay_goals:
-            player = analysis["player"]
-            reachable_relay = self._filter_valid_motion_goals(player, relay_goals)
-            if reachable_relay:
+        # 2) If soup-side dish traffic is urgent, free hand now.
+        # Prefer non-handoff counters, then use an empty handoff slot as fallback.
+        if needs_dish_handoff:
+            drop_goals = self._safe_non_handoff_drop_goals(state, analysis)
+            if not drop_goals:
+                drop_goals = self._empty_handoff_goals(analysis)
+            if drop_goals:
                 return self._decision(
-                    f"drop_{ingredient}_for_partner", self.PREP_ROLE, relay_goals
+                    f"drop_{ingredient}_clear_for_dish",
+                    self.SERVE_ROLE,
+                    drop_goals,
                 )
+            return None
+
+        if not analysis["fillable_pots"]:
+            drop_goals = (
+                self._safe_non_handoff_drop_goals(state, analysis)
+                if is_giver
+                else self._drop_motion_goals(state, analysis)
+            )
+            if drop_goals:
+                return self._decision(
+                    f"drop_{ingredient}_to_clear", self.PREP_ROLE, drop_goals
+                )
+            return None
+
+        shared_visible = analysis["shared_counter_objects"]
+        missing_required = self._ingredient_missing_total(analysis, ingredient)
+        # _ingredient_pipeline_supply counts self by construction when holding.
+        pipeline_without_self = max(
+            0,
+            self._ingredient_pipeline_supply(analysis, ingredient, shared_visible) - 1,
+        )
+
+        relay_needed = pipeline_without_self < missing_required
+        if relay_needed:
+            relay_goals = self._empty_handoff_goals(analysis)
+            if relay_goals:
+                player = analysis["player"]
+                reachable_relay = self._filter_valid_motion_goals(player, relay_goals)
+                if reachable_relay:
+                    return self._decision(
+                        f"drop_{ingredient}_for_partner", self.PREP_ROLE, relay_goals
+                    )
+        else:
+            print(
+                "[DEBUG]   _plan_ingredient_in_hand: skip relay, {} already covered ({}/{})".format(
+                    ingredient, pipeline_without_self, missing_required
+                )
+            )
+
+        if is_giver:
+            drop_goals = self._safe_non_handoff_drop_goals(state, analysis)
+            if not drop_goals and not relay_needed:
+                # If ingredient is extra, allow clearing onto empty handoff lane
+                # so the agent does not deadlock while holding it.
+                drop_goals = self._empty_handoff_goals(analysis)
+            if drop_goals:
+                return self._decision(
+                    f"drop_{ingredient}_to_clear", self.PREP_ROLE, drop_goals
+                )
+            return None
 
         drop_goals = self._drop_motion_goals(state, analysis)
         if drop_goals:
@@ -545,11 +627,57 @@ class StateAwarePlanningAgent(GreedyHumanModel):
     def _plan_receiver_pickup(self, state, analysis):
         """
         Receiver: collect items giver has left on the shared counter.
-        Priority: soup > dish > ingredient.
-        """
-        shared = analysis["pickup_shared_counter_objects"]
 
-        # Soup on counter (giver somehow got it there — rare but handle it)
+        Priority:
+        1. If cooking/ready soup needs dish traffic and shared lane is clogged
+        with ingredients, clear one ingredient first.
+        2. Soup on counter
+        3. Dish on shared counter
+        4. Ingredient on shared counter
+        """
+        shared_visible = analysis["shared_counter_objects"]
+        shared_pickable = analysis["pickup_shared_counter_objects"]
+
+        total_slots = len(analysis["handoff_counters"])
+        empty_slots = len(
+            [pos for pos in analysis["handoff_counters"] if pos in set(analysis["empty_drop_counters"])]
+        )
+        staged_dishes = len(shared_visible["dish"])
+        staged_onions = len(shared_visible["onion"])
+        staged_tomatoes = len(shared_visible["tomato"])
+        staged_ingredients = staged_onions + staged_tomatoes
+
+        pot_active = bool(analysis["ready_pots"] or analysis["cooking_pots"])
+
+        print(
+            f"[DEBUG] _plan_receiver_pickup: pot_active={pot_active}, "
+            f"empty_slots={empty_slots}/{total_slots}, staged_dishes={staged_dishes}, "
+            f"staged_ingredients={staged_ingredients}"
+        )
+
+        # D: If lane is clogged with ingredients and dish traffic is/will be needed,
+        # clear one ingredient first so giver can pass a dish.
+        if pot_active and staged_dishes == 0 and staged_ingredients > 0 and empty_slots == 0:
+            ingredient = None
+            if shared_pickable["onion"]:
+                ingredient = "onion"
+            elif shared_pickable["tomato"]:
+                ingredient = "tomato"
+            elif shared_visible["onion"]:
+                ingredient = "onion"
+            elif shared_visible["tomato"]:
+                ingredient = "tomato"
+
+            if ingredient is not None:
+                print(f"[DEBUG]   receiver clearing clogged lane: {ingredient}")
+                ingredient_positions = list(shared_pickable[ingredient]) or list(shared_visible[ingredient])
+                return self._decision(
+                    f"receiver_clear_shared_{ingredient}",
+                    self.PREP_ROLE,
+                    self._motion_goals_for_positions([ingredient_positions[0]]),
+                )
+
+        # Soup on counter
         if analysis["counter_soups"]:
             soup_goals = self.mlam.pickup_counter_soup_actions(
                 analysis["pickup_counter_objects"]
@@ -559,120 +687,186 @@ class StateAwarePlanningAgent(GreedyHumanModel):
                     "receiver_pickup_soup", self.SERVE_ROLE, soup_goals
                 )
 
-        # Dish waiting — use it to serve a ready or cooking pot
-        if shared["dish"] and (analysis["ready_pots"] or analysis["cooking_pots"]):
+        # Dish waiting on shared lane
+        if shared_pickable["dish"] and pot_active:
             return self._decision(
                 "receiver_pickup_dish",
                 self.SERVE_ROLE,
-                self._motion_goals_for_positions(list(shared["dish"])),
+                self._motion_goals_for_positions(list(shared_pickable["dish"])),
             )
 
-        # Ingredient waiting — put it in a fillable pot
+        # Ingredient waiting on shared lane
         if analysis["fillable_pots"]:
             ingredient = self._select_prepare_ingredient(analysis)
-            if ingredient and shared[ingredient]:
+            if ingredient and shared_pickable[ingredient]:
                 return self._decision(
-                    "receiver_pickup_{}".format(ingredient),
+                    f"receiver_pickup_{ingredient}",
                     self.PREP_ROLE,
-                    self._motion_goals_for_positions(list(shared[ingredient])),
+                    self._motion_goals_for_positions(list(shared_pickable[ingredient])),
                 )
 
         return None
+
 
     def _plan_giver_prefetch(self, state, analysis):
         """
-        Giver: figure out what the receiver will need next and stage it.
+        Giver: stage exactly what receiver will need next, without clogging the lane.
 
-        The decision is based on the receiver's most urgent upcoming action:
-
-          pot is cooking or ready  →  receiver needs a DISH  →  fetch a dish
-          pot is fillable          →  receiver needs an INGREDIENT  →  fetch it
-
-        When both are true (e.g. one pot cooking, another fillable), cooking
-        takes priority so the receiver can serve soup without waiting.
-
-        Also: only stage one item at a time.  If the counter already has the
-        right item, hold off — don't clutter the counter.
+        Safeguards:
+        A. Always reserve at least one empty shared slot for dish traffic.
+        B. Never rely on occupied-counter fallback.
+        C. Cap staged ingredients to 1 total on forced maps.
+        D. Receiver-side recovery is handled in _plan_receiver_pickup.
         """
-        empty_handoff = [
-            pos
-            for pos in analysis["handoff_counters"]
-            if pos in set(analysis["empty_drop_counters"])
-        ]
-        if not empty_handoff:
-            return None  # Counter full — wait for partner to clear it.
+        # Use raw shared-counter visibility for staging decisions so reservation
+        # filtering does not trick the giver into re-staging duplicate onions.
+        shared_visible = analysis["shared_counter_objects"]
 
-        shared = analysis["pickup_shared_counter_objects"]
+        total_slots = len(analysis["handoff_counters"])
+        empty_slots = len(
+            [pos for pos in analysis["handoff_counters"] if pos in set(analysis["empty_drop_counters"])]
+        )
+        staged_dishes = len(shared_visible["dish"])
+        staged_onions = len(shared_visible["onion"])
+        staged_tomatoes = len(shared_visible["tomato"])
+        staged_ingredients = staged_onions + staged_tomatoes
+
         pot_active = bool(analysis["cooking_pots"] or analysis["ready_pots"])
 
-        # ── Priority A: receiver needs a dish ────────────────────────────────
-        # Triggered when any pot is cooking or ready, regardless of timer.
-        # The giver's job is to pre-stage the dish; receiver decides when to
-        # collect it based on the cooking timer.
-        if pot_active and not shared["dish"]:
-            dish_goals = self.mlam.pickup_dish_actions(
-                analysis["pickup_counter_objects"]
-            )
-            if dish_goals:
-                return self._decision(
-                    "giver_fetch_dish_for_partner", self.SERVE_ROLE, dish_goals
-                )
+        print(
+            f"[DEBUG] _plan_giver_prefetch: pot_active={pot_active}, "
+            f"empty_slots={empty_slots}/{total_slots}, staged_dishes={staged_dishes}, "
+            f"staged_onions={staged_onions}, staged_tomatoes={staged_tomatoes}"
+        )
 
-        # Dish already staged — giver should wait, not fetch another item.
-        if pot_active:
+        # If there is literally no empty slot, do nothing.
+        # Receiver must clear first.
+        if empty_slots == 0:
+            print("[DEBUG]   giver waits: no empty handoff slot")
             return None
 
-        # ── Priority B: receiver needs an ingredient ──────────────────────────
-        # Only reached when NO pot is currently cooking or ready.
+        # A: Always reserve one empty slot for future dish traffic.
+        # So ingredients may only be staged when there are at least 2 empty slots.
+        reserve_one_for_dish = True
+
+        # --------------------------------------------------
+        # Priority A: stage dish if soup is active
+        # --------------------------------------------------
+        if pot_active:
+            # If no dish is already staged, use the lane for dish.
+            if staged_dishes == 0:
+                dish_goals = self.mlam.pickup_dish_actions(
+                    analysis["pickup_counter_objects"]
+                )
+                if dish_goals:
+                    print("[DEBUG]   giver staging dish for active pot")
+                    return self._decision(
+                        "giver_fetch_dish_for_partner",
+                        self.SERVE_ROLE,
+                        dish_goals,
+                    )
+
+            # If dish already staged, do not also stuff ingredients into the lane.
+            print("[DEBUG]   giver waits: pot active and dish handling dominates")
+            return None
+
+        # --------------------------------------------------
+        # Priority B: stage ingredient only if safe
+        # --------------------------------------------------
         if analysis["fillable_pots"]:
             ingredient = self._select_prepare_ingredient(analysis)
-            if ingredient and not shared[ingredient]:
-                ingredient_goals = self._pickup_ingredient_motion_goals(
-                    ingredient, analysis["pickup_counter_objects"]
-                )
-                if ingredient_goals:
-                    return self._decision(
-                        "giver_fetch_{}_for_partner".format(ingredient),
-                        self.PREP_ROLE,
-                        ingredient_goals,
+
+            if ingredient is None:
+                print("[DEBUG]   giver waits: no ingredient selected")
+                return None
+
+            # C: cap staged ingredients to 1 total
+            if staged_ingredients >= 1:
+                print("[DEBUG]   giver waits: ingredient already staged")
+                return None
+
+            missing_required = self._ingredient_missing_total(analysis, ingredient)
+            staged_or_carried = self._ingredient_pipeline_supply(
+                analysis, ingredient, shared_visible
+            )
+            if staged_or_carried >= missing_required:
+                print(
+                    "[DEBUG]   giver waits: enough {} already in pipeline ({}/{})".format(
+                        ingredient, staged_or_carried, missing_required
                     )
+                )
+                return None
+
+            # A again: keep one slot reserved for dish
+            # If we reserve one slot, then to place an ingredient safely we need >= 2 empty slots.
+            if reserve_one_for_dish and empty_slots <= 1:
+                print("[DEBUG]   giver waits: reserving final slot for dish")
+                return None
+
+            # Do not duplicate an already staged ingredient
+            if ingredient == "onion" and staged_onions > 0:
+                print("[DEBUG]   giver waits: onion already staged")
+                return None
+            if ingredient == "tomato" and staged_tomatoes > 0:
+                print("[DEBUG]   giver waits: tomato already staged")
+                return None
+
+            ingredient_goals = self._pickup_ingredient_motion_goals(
+                ingredient, analysis["pickup_counter_objects"]
+            )
+            if ingredient_goals:
+                print(f"[DEBUG]   giver staging ingredient: {ingredient}")
+                return self._decision(
+                    f"giver_fetch_{ingredient}_for_partner",
+                    self.PREP_ROLE,
+                    ingredient_goals,
+                )
 
         return None
 
-    # ── Counter/handoff helpers ───────────────────────────────────────────────
+    def _ingredient_missing_total(self, analysis, ingredient_name):
+        target_amount = analysis["target_counts"].get(ingredient_name, 0)
+        if target_amount <= 0:
+            return 0
 
+        total_missing = 0
+        for pot_pos in analysis["fillable_pots"]:
+            current_amount = self._pot_ingredient_counts(
+                analysis["state"], pot_pos
+            )[ingredient_name]
+            total_missing += max(0, target_amount - current_amount)
+        return total_missing
+
+    def _ingredient_pipeline_supply(self, analysis, ingredient_name, shared_counter_objects):
+        supply = len(shared_counter_objects[ingredient_name])
+        if analysis["player_object"] == ingredient_name:
+            supply += 1
+        if analysis["partner_object"] == ingredient_name:
+            supply += 1
+        return supply
+
+    # ── Counter/handoff helpers ───────────────────────────────────────────────
     def _empty_handoff_goals(self, analysis):
         """
-        Motion goals for slots on the shared handoff counter.
-        
-        Priority 1: Empty slots (preferred)
-        Priority 2: If no empty slots AND holding an item that needs placing,
-                    fallback to ANY handoff counter slot (items may stack/push).
+        Motion goals for EMPTY slots on the shared handoff counter only.
+
+        Important:
+        - No fallback to occupied handoff counters.
+        - On forced-coordination maps, occupied counters are a blocked lane,
+        not valid staging targets.
         """
         empty_set = set(analysis["empty_drop_counters"])
-        targets = [
-            pos for pos in analysis["handoff_counters"] if pos in empty_set
-        ]
-        print(f"[DEBUG]       _empty_handoff_goals: handoff_counters={len(analysis['handoff_counters'])}, "
-              f"empty_drops={len(empty_set)}, empty_targets={len(targets)}")
-        
-        # If empty slots available, use them
-        if targets:
-            result = self._motion_goals_for_positions(targets)
-            print(f"[DEBUG]         -> using empty slots: {len(result)} goals")
-            return result
-        
-        # Fallback: if ALL empty slots are full, try ANY handoff counter
-        # This allows stacking/pushing items (e.g., giver drops onion on counter
-        # that already has a dish; receiver will pick up one or both)
-        if analysis["handoff_counters"]:
-            result = self._motion_goals_for_positions(analysis["handoff_counters"])
-            print(f"[DEBUG]         -> fallback to ANY handoff slot (full): {len(result)} goals")
-            return result
-        
-        print(f"[DEBUG]         -> no handoff counters available")
-        return []
+        targets = [pos for pos in analysis["handoff_counters"] if pos in empty_set]
 
+        print(
+            f"[DEBUG] _empty_handoff_goals: total={len(analysis['handoff_counters'])}, "
+            f"empty={len(targets)}"
+        )
+
+        if not targets:
+            return []
+
+        return self._motion_goals_for_positions(targets)
     # ── Soup pickup ───────────────────────────────────────────────────────────
 
     def _pickup_soup_motion_goals(self, analysis):
@@ -1044,6 +1238,22 @@ class StateAwarePlanningAgent(GreedyHumanModel):
         if not positions:
             return []
         return self.mlam._get_ml_actions_for_positions(list(positions))
+
+    def _safe_non_handoff_drop_goals(self, state, analysis):
+        """
+        Prefer clearing inventory onto non-shared counters so the handoff lane
+        stays open for urgent dish traffic.
+        """
+        handoff_set = set(analysis["handoff_counters"])
+        non_handoff_empty = [
+            pos
+            for pos in analysis["empty_drop_counters"]
+            if pos not in handoff_set
+        ]
+        if not non_handoff_empty:
+            print("[DEBUG]       _safe_non_handoff_drop_goals: none available")
+            return []
+        return self._motion_goals_for_positions(non_handoff_empty)
 
     def _drop_motion_goals(self, state, analysis, preferred_positions=None):
         valid_empty = set(analysis["empty_drop_counters"])
