@@ -1,6 +1,7 @@
 import itertools
 import os
 import pickle
+import threading
 import time
 
 import numpy as np
@@ -24,6 +25,9 @@ from overcooked_ai_py.utils import manhattan_distance
 # computation to prevent or identify possible minor errors
 SAFE_RUN = False
 
+_PLANNER_FILE_LOCKS = {}
+_PLANNER_FILE_LOCKS_GUARD = threading.Lock()
+
 NO_COUNTERS_PARAMS = {
     "start_orientations": False,
     "wait_allowed": False,
@@ -41,6 +45,26 @@ NO_COUNTERS_START_OR_PARAMS = {
     "counter_pickup": [],
     "same_motion_goals": True,
 }
+
+
+def _get_planner_file_lock(filename):
+    with _PLANNER_FILE_LOCKS_GUARD:
+        if filename not in _PLANNER_FILE_LOCKS:
+            _PLANNER_FILE_LOCKS[filename] = threading.Lock()
+        return _PLANNER_FILE_LOCKS[filename]
+
+
+def _atomic_pickle_dump(obj, filepath):
+    tmp_filepath = "{}.tmp.{}.{}".format(
+        filepath, os.getpid(), threading.get_ident()
+    )
+    try:
+        with open(tmp_filepath, "wb") as output:
+            pickle.dump(obj, output, pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_filepath, filepath)
+    finally:
+        if os.path.exists(tmp_filepath):
+            os.remove(tmp_filepath)
 
 
 class MotionPlanner(object):
@@ -68,8 +92,7 @@ class MotionPlanner(object):
         self.all_plans = self._populate_all_plans()
 
     def save_to_file(self, filename):
-        with open(filename, "wb") as output:
-            pickle.dump(self, output, pickle.HIGHEST_PROTOCOL)
+        _atomic_pickle_dump(self, filename)
 
     @staticmethod
     def from_file(filename):
@@ -91,28 +114,33 @@ class MotionPlanner(object):
             else mdp.layout_name + "_mp.pkl"
         )
 
-        if force_compute:
-            return MotionPlanner.compute_mp(filename, mdp, counter_goals)
-
-        try:
-            mp = MotionPlanner.from_file(filename)
-
-            if mp.counter_goals != counter_goals or mp.mdp != mdp:
-                if info:
-                    print(
-                        "motion planner with different counter goal or mdp found, computing from scratch"
-                    )
+        planner_lock = _get_planner_file_lock(filename)
+        with planner_lock:
+            if force_compute:
                 return MotionPlanner.compute_mp(filename, mdp, counter_goals)
 
-        except (
-            FileNotFoundError,
-            ModuleNotFoundError,
-            EOFError,
-            AttributeError,
-        ) as e:
-            if info:
-                print("Recomputing motion planner due to:", e)
-            return MotionPlanner.compute_mp(filename, mdp, counter_goals)
+            try:
+                mp = MotionPlanner.from_file(filename)
+
+                if mp.counter_goals != counter_goals or mp.mdp != mdp:
+                    if info:
+                        print(
+                            "motion planner with different counter goal or mdp found, computing from scratch"
+                        )
+                    return MotionPlanner.compute_mp(
+                        filename, mdp, counter_goals
+                    )
+
+            except (
+                FileNotFoundError,
+                ModuleNotFoundError,
+                EOFError,
+                AttributeError,
+                pickle.UnpicklingError,
+            ) as e:
+                if info:
+                    print("Recomputing motion planner due to:", e)
+                return MotionPlanner.compute_mp(filename, mdp, counter_goals)
 
         if info:
             print(
@@ -1125,8 +1153,7 @@ class MediumLevelActionManager(object):
         self.motion_planner = self.joint_motion_planner.motion_planner
 
     def save_to_file(self, filename):
-        with open(filename, "wb") as output:
-            pickle.dump(self, output, pickle.HIGHEST_PROTOCOL)
+        _atomic_pickle_dump(self, filename)
 
     @staticmethod
     def from_file(filename):
@@ -1144,34 +1171,37 @@ class MediumLevelActionManager(object):
             else mdp.layout_name + "_am.pkl"
         )
 
-        if force_compute:
-            return MediumLevelActionManager.compute_mlam(
-                filename, mdp, mlam_params, info=info
-            )
-
-        try:
-            mlam = MediumLevelActionManager.from_file(filename)
-
-            if mlam.params != mlam_params or mlam.mdp != mdp:
-                if info:
-                    print(
-                        "medium level action manager with different params or mdp found, computing from scratch"
-                    )
+        planner_lock = _get_planner_file_lock(filename)
+        with planner_lock:
+            if force_compute:
                 return MediumLevelActionManager.compute_mlam(
                     filename, mdp, mlam_params, info=info
                 )
 
-        except (
-            FileNotFoundError,
-            ModuleNotFoundError,
-            EOFError,
-            AttributeError,
-        ) as e:
-            if info:
-                print("Recomputing planner due to:", e)
-            return MediumLevelActionManager.compute_mlam(
-                filename, mdp, mlam_params, info=info
-            )
+            try:
+                mlam = MediumLevelActionManager.from_file(filename)
+
+                if mlam.params != mlam_params or mlam.mdp != mdp:
+                    if info:
+                        print(
+                            "medium level action manager with different params or mdp found, computing from scratch"
+                        )
+                    return MediumLevelActionManager.compute_mlam(
+                        filename, mdp, mlam_params, info=info
+                    )
+
+            except (
+                FileNotFoundError,
+                ModuleNotFoundError,
+                EOFError,
+                AttributeError,
+                pickle.UnpicklingError,
+            ) as e:
+                if info:
+                    print("Recomputing planner due to:", e)
+                return MediumLevelActionManager.compute_mlam(
+                    filename, mdp, mlam_params, info=info
+                )
 
         if info:
             print(

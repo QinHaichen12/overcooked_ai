@@ -1,4 +1,6 @@
+import pickle
 import unittest
+from unittest.mock import patch
 
 from overcooked_ai_py.agents.agent import AgentPair, GreedyHumanModel
 from overcooked_ai_py.agents.benchmarking import AgentEvaluator
@@ -11,7 +13,10 @@ from overcooked_ai_py.mdp.overcooked_mdp import (
     PlayerState,
     SoupState,
 )
-from overcooked_ai_py.planning.planners import MediumLevelActionManager
+from overcooked_ai_py.planning.planners import (
+    MediumLevelActionManager,
+    MotionPlanner,
+)
 
 large_mdp_tests = False
 force_compute = True
@@ -123,6 +128,24 @@ def soup_obj(soup_loc, num_onion_inside, cooking_tick):
 
 
 class TestMotionPlanner(unittest.TestCase):
+    def test_from_pickle_or_compute_recovers_from_truncated_pickle(self):
+        sentinel_mp = object()
+        with patch.object(
+            MotionPlanner,
+            "from_file",
+            side_effect=pickle.UnpicklingError("pickle data was truncated"),
+        ), patch.object(
+            MotionPlanner, "compute_mp", return_value=sentinel_mp
+        ) as compute_mp:
+            result = MotionPlanner.from_pickle_or_compute(
+                simple_mdp,
+                counter_goals=[],
+                custom_filename="corrupted_motion_planner.pkl",
+            )
+
+        self.assertIs(result, sentinel_mp)
+        compute_mp.assert_called_once()
+
     def test_gridworld_distance(self):
         planner = ml_action_manager_simple.joint_motion_planner.motion_planner
         start = ((2, 1), e)
@@ -434,6 +457,26 @@ class TestJointMotionPlanner(unittest.TestCase):
 
 # Rewritten because the previous test depended on Heuristic, and Heuristic has been deprecated
 class TestMediumLevelActionManagerSimple(unittest.TestCase):
+    def test_from_pickle_or_compute_recovers_from_truncated_pickle(self):
+        sentinel_mlam = object()
+        with patch.object(
+            MediumLevelActionManager,
+            "from_file",
+            side_effect=pickle.UnpicklingError("pickle data was truncated"),
+        ), patch.object(
+            MediumLevelActionManager,
+            "compute_mlam",
+            return_value=sentinel_mlam,
+        ) as compute_mlam:
+            result = MediumLevelActionManager.from_pickle_or_compute(
+                simple_mdp,
+                mlam_params=base_params,
+                custom_filename="corrupted_action_manager.pkl",
+            )
+
+        self.assertIs(result, sentinel_mlam)
+        compute_mlam.assert_called_once()
+
     def test_simple_mdp_without_start_orientations(self):
         print("Simple - no start orientations (& shared motion goals)")
         mlam = ml_action_manager_simple

@@ -14,11 +14,15 @@ try:
 except ImportError:
     ray = None
 from utils import DOCKER_VOLUME, create_dirs
-from overcooked_ai_py.agents.agent import RandomAgent
+from overcooked_ai_py.agents.agent import GreedyHumanModel, RandomAgent
+from overcooked_ai_py.agents.state_aware_planning_agent import (
+    StateAwarePlanningAgent,
+)
 from overcooked_ai_py.mdp.actions import Action, Direction
 from overcooked_ai_py.mdp.overcooked_env import OvercookedEnv
 from overcooked_ai_py.mdp.overcooked_mdp import OvercookedGridworld
 from overcooked_ai_py.planning.planners import (
+    MediumLevelActionManager,
     NO_COUNTERS_PARAMS,
     MotionPlanner,
 )
@@ -642,7 +646,10 @@ class OvercookedGame(Game):
         self.score = 0
         self.threads = []
         for npc_policy in self.npc_policies:
-            self.npc_policies[npc_policy].reset()
+            policy = self.npc_policies[npc_policy]
+            policy.reset()
+            if hasattr(policy, "set_agent_index"):
+                policy.set_agent_index(self.players.index(npc_policy))
             self.npc_state_queues[npc_policy].put(self.state)
             t = Thread(target=self.npc_policy_consumer, args=(npc_policy,))
             self.threads.append(t)
@@ -679,11 +686,30 @@ class OvercookedGame(Game):
 
     def get_policy(self, npc_id, idx=0):
         if npc_id.lower() in [
+            "greedyhumanmodel",
+            "greedyhumanai",
+            "greedyhelperai",
+        ]:
+            return DemoGreedyHumanAI(
+                agent_index=idx, mdp_getter=lambda: self.mdp
+            )
+
+        if npc_id.lower() in [
             "bayesianbeliefai",
             "bayesbeliefai",
             "bayesianhelperai",
         ]:
             return BayesianBeliefAI(
+                agent_index=idx, mdp_getter=lambda: self.mdp
+            )
+
+        if npc_id.lower() in [
+            "stateawareplanningai",
+            "stateawareplanningagent",
+            "stateawareai",
+            "state_aware",
+        ]:
+            return DemoStateAwarePlanningAI(
                 agent_index=idx, mdp_getter=lambda: self.mdp
             )
 
@@ -711,7 +737,10 @@ class OvercookedGame(Game):
                     os.path.join(AGENT_DIR, npc_id, "agent.pickle")
                 )
                 with open(fpath, "rb") as f:
-                    return pickle.load(f)
+                    agent = pickle.load(f)
+                    if hasattr(agent, "set_agent_index"):
+                        agent.set_agent_index(idx)
+                    return agent
             except Exception as e:
                 raise IOError("Error loading agent\n{}".format(e.__repr__()))
 
@@ -822,6 +851,149 @@ class DummyOvercookedGame(OvercookedGame):
 
     def get_policy(self, *args, **kwargs):
         return DummyAI()
+
+
+class DemoGreedyHumanAI:
+    """
+    Runtime wrapper for GreedyHumanModel that rebuilds planner state against the
+    current demo layout when needed.
+    """
+
+    def __init__(self, agent_index=0, mdp_getter=lambda: None):
+        self.agent_index = agent_index
+        self._mdp_getter = mdp_getter
+        self._inner = None
+        self._layout_name = None
+
+    def reset(self):
+        self._inner = None
+        self._layout_name = None
+
+    def set_agent_index(self, agent_index):
+        self.agent_index = agent_index
+        if self._inner is not None:
+            self._inner.set_agent_index(agent_index)
+
+    def _ensure_inner(self):
+        mdp = self._mdp_getter()
+        if mdp is None:
+            raise ValueError("GreedyHumanModel requested before MDP init")
+
+        layout_name = getattr(mdp, "layout_name", None)
+        if self._inner is None or self._layout_name != layout_name:
+            mlam = MediumLevelActionManager.from_pickle_or_compute(
+                mdp, NO_COUNTERS_PARAMS
+            )
+            self._inner = GreedyHumanModel(mlam)
+            self._inner.set_agent_index(self.agent_index)
+            self._layout_name = layout_name
+
+        return self._inner
+
+    def action(self, state):
+        return self._ensure_inner().action(state)
+
+
+class DemoStateAwarePlanningAI:
+    """
+    Runtime wrapper for StateAwarePlanningAgent that rebuilds planner state
+    against the current demo layout when needed.
+    """
+
+    def __init__(self, agent_index=0, mdp_getter=lambda: None):
+        self.agent_index = agent_index
+        self._mdp_getter = mdp_getter
+        self._inner = None
+        self._fallback = None
+        self._layout_name = None
+        self._build_layout_name = None
+        self._build_thread = None
+        self._build_lock = Lock()
+
+    def reset(self):
+        self._inner = None
+        self._fallback = None
+        self._layout_name = None
+        self._build_layout_name = None
+        self._build_thread = None
+
+    def set_agent_index(self, agent_index):
+        self.agent_index = agent_index
+        if self._inner is not None:
+            self._inner.set_agent_index(agent_index)
+        if self._fallback is not None:
+            self._fallback.set_agent_index(agent_index)
+
+    def _ensure_fallback(self):
+        mdp = self._mdp_getter()
+        if mdp is None:
+            raise ValueError("StateAwarePlanningAgent requested before MDP init")
+
+        layout_name = getattr(mdp, "layout_name", None)
+        if self._fallback is None or self._layout_name != layout_name:
+            self._inner = None
+            mlam = MediumLevelActionManager.from_pickle_or_compute(
+                mdp, NO_COUNTERS_PARAMS
+            )
+            self._fallback = GreedyHumanModel(mlam)
+            self._fallback.set_agent_index(self.agent_index)
+            self._layout_name = layout_name
+
+        return self._fallback
+
+    def _maybe_start_background_build(self):
+        mdp = self._mdp_getter()
+        if mdp is None:
+            return
+
+        layout_name = getattr(mdp, "layout_name", None)
+        with self._build_lock:
+            if self._inner is not None and self._layout_name == layout_name:
+                return
+            if (
+                self._build_thread is not None
+                and self._build_thread.is_alive()
+                and self._build_layout_name == layout_name
+            ):
+                return
+
+            self._build_layout_name = layout_name
+            self._build_thread = Thread(
+                target=self._build_inner_in_background,
+                args=(mdp, layout_name),
+                daemon=True,
+            )
+            self._build_thread.start()
+
+    def _build_inner_in_background(self, mdp, layout_name):
+        try:
+            mlam = MediumLevelActionManager.from_pickle_or_compute(
+                mdp, NO_COUNTERS_PARAMS
+            )
+            inner = StateAwarePlanningAgent(mlam)
+            inner.set_agent_index(self.agent_index)
+        except Exception as e:
+            print(
+                "Warning: failed to initialize StateAwarePlanningAgent for {} ({})".format(
+                    layout_name, e
+                )
+            )
+            return
+
+        with self._build_lock:
+            if self._layout_name != layout_name:
+                return
+            self._inner = inner
+
+    def action(self, state):
+        mdp = self._mdp_getter()
+        layout_name = getattr(mdp, "layout_name", None) if mdp is not None else None
+        if self._inner is not None and self._layout_name == layout_name:
+            return self._inner.action(state)
+
+        fallback = self._ensure_fallback()
+        self._maybe_start_background_build()
+        return fallback.action(state)
 
 
 class BayesianBeliefAI:
